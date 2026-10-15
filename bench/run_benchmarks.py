@@ -259,6 +259,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"WARNING: m={missing} (GitHub Actions runner sizes) not measured")
 
     machine = machine_info()
+    if machine["smartpar_dirty"]:
+        bar = "!" * 78
+        print(
+            f"{bar}\nWARNING: uncommitted changes in the tool's code - this series cannot be "
+            f"reproduced from smartpar_sha {machine['smartpar_sha'][:12]}:"
+        )
+        for line in machine["smartpar_dirty_files"]:
+            print(f"    {line}")
+        print(f"Commit them before a series for the article.\n{bar}")
     series = args.results / f"{datetime.now():%Y%m%d_%H%M%S}_{machine['host']}"
     raw = series / "raw"
     raw.mkdir(parents=True)
@@ -273,8 +282,9 @@ def main(argv: list[str] | None = None) -> int:
     }
     for project in projects:
         _src, venv = project.paths(args.work)
+        sha = pinned_sha(project, args.work)
         env["projects"][project.name] = {
-            "sha": pinned_sha(project, args.work),
+            "project_sha": sha,
             "ref": project.ref,
             "local": project.local,
             "status": project.status,
@@ -283,6 +293,14 @@ def main(argv: list[str] | None = None) -> int:
             "deselect": project.deselect,
             "ground_truth": project.ground_truth,
         }
+        if project.local is not None:
+            # A project inside this repository: its source is the repository at
+            # smartpar_sha; project_sha is only the workspace snapshot commit.
+            env["projects"][project.name]["control_source"] = {
+                "path": project.local,
+                "smartpar_sha": machine["smartpar_sha"],
+                "smartpar_dirty": machine["smartpar_dirty"],
+            }
     (series / "env.json").write_text(json.dumps(env, indent=2))
 
     jobs = jobs_for(args.configs, workers)

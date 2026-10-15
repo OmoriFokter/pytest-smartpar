@@ -27,6 +27,24 @@ def test_summary_and_confidence_interval() -> None:
     assert analyze.t95(100) == 1.96
 
 
+@pytest.mark.parametrize(
+    ("df", "t"),
+    # Two-sided 95 % critical values of Student's t (standard tables).
+    [(1, 12.706), (2, 4.303), (4, 2.776), (9, 2.262), (19, 2.093), (29, 2.045), (30, 2.042)],
+)
+def test_student_t_critical_values(df: int, t: float) -> None:
+    assert analyze.t95(df) == t
+    assert len(analyze.T95) == 30
+    assert all(a > b for a, b in zip(analyze.T95, analyze.T95[1:], strict=False))
+
+
+def test_ci_for_five_repeats_uses_t_not_normal() -> None:
+    values = [1.0, 2.0, 3.0, 4.0, 5.0]
+    s = analyze.summarize(values)
+    assert s["ci95"] == pytest.approx(2.776 * s["std"] / math.sqrt(5))
+    assert s["ci95"] > 1.96 * s["std"] / math.sqrt(5)
+
+
 def test_karp_flatt_and_amdahl_are_consistent() -> None:
     for e in (0.0, 0.05, 0.3):
         for m in (2, 4, 8):
@@ -258,3 +276,11 @@ def test_analyze_synthetic_series(tmp_path: Path) -> None:
     # wall = w + 0.01 r, predicted = 0.9 w: mean error (w + 0.01 - 0.9 w) / (0.9 w)
     assert by_m[2] == pytest.approx((0.1 * 4.0 + 0.01) / 3.6 * 100)
     assert by_m[4] == pytest.approx((0.1 * 2.0 + 0.01) / 1.8 * 100)
+
+
+def test_env_marks_uncommitted_tool_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup_projects, "smartpar_dirty", lambda: [" M src/smartpar/plugin.py"])
+    info = setup_projects.machine_info()
+    assert info["smartpar_dirty"] is True
+    assert info["smartpar_dirty_files"] == [" M src/smartpar/plugin.py"]
+    assert len(info["smartpar_sha"]) == 40

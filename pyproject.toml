@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-bench = ["matplotlib>=3.7", "pyyaml>=6", "numpy>=1.24"]
+bench = ["matplotlib>=3.7", "pyyaml>=6"]
 dev = ["ruff>=0.6"]
 
 [project.entry-points.pytest11]

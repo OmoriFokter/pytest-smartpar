@@ -231,9 +231,19 @@ def ram_bytes() -> int | None:
     return None
 
 
+# Paths whose uncommitted changes make a series irreproducible from smartpar_sha.
+TOOL_PATHS = ("src", "bench", "examples", "pyproject.toml")
+
+
+def smartpar_dirty() -> list[str]:
+    """Uncommitted (incl. untracked) changes in the tool's code, as `git status` lines."""
+    out = git(REPO_ROOT, "status", "--porcelain", "--untracked-files=all", "--", *TOOL_PATHS)
+    return [line for line in out.splitlines() if line.strip()]
+
+
 def machine_info() -> dict[str, Any]:
     smartpar_sha = git(REPO_ROOT, "rev-parse", "HEAD")
-    dirty = bool(git(REPO_ROOT, "status", "--porcelain", "--untracked-files=no"))
+    dirty = smartpar_dirty()
     return {
         "date": datetime.now(timezone.utc).isoformat(),
         "host": platform.node(),
@@ -244,7 +254,8 @@ def machine_info() -> dict[str, Any]:
         "os": platform.platform(),
         "runner_python": sys.version.split()[0],
         "smartpar_sha": smartpar_sha,
-        "smartpar_dirty": dirty,
+        "smartpar_dirty": bool(dirty),
+        "smartpar_dirty_files": dirty,
         "argv": sys.argv,
     }
 

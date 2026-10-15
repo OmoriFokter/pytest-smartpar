@@ -10,4 +10,6 @@ build/
 .smartpar/
 bench/results/*
 !bench/results/.gitkeep
+# The final series used in the article is copied here and committed.
+!bench/results/published/
 bench/work/
