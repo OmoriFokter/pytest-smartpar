@@ -1,8 +1,243 @@
 """Method step 5 (recording): run history without locks.
 
-Normal runs only read history.json and write a separate runs/run_<utc>_<pid>.json;
-``smartpar merge`` folds run files into history.json with an exponential moving
-average of durations. All files are written atomically (temp file + os.replace).
+Readers-writers model:
 
-Not implemented yet (phase 2).
+* a normal run only *reads* history.json (a snapshot at start) and *writes* a
+  separate ``runs/run_<utc>_<pid>.json``, so concurrent runs never contend for
+  a shared file;
+* ``smartpar merge`` folds the run files into history.json with an
+  exponential moving average ``duration_ema = alpha*new + (1-alpha)*old``,
+  processing runs sorted by start time, then moves them to ``runs/merged/``;
+* every file is written atomically: a temporary file in the same directory,
+  fsync, then ``os.replace`` (or ``os.link`` where the name must be new), so a
+  reader sees either the old or the new complete file, never a partial one.
 """
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import tempfile
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from smartpar.models import (
+    FAILED_OUTCOMES,
+    History,
+    RunRecord,
+    SchemaError,
+    TestHistory,
+)
+
+try:  # POSIX only; on Windows concurrent merges are not guarded.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
+log = logging.getLogger("smartpar.history")
+
+HISTORY_FILE = "history.json"
+RUNS_DIR = "runs"
+MERGED_DIR = "merged"
+MERGE_LOCK = ".merge.lock"
+DEFAULT_ALPHA = 0.3
+
+
+def _dump(data: Any) -> bytes:
+    return (json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
+
+
+def _write_temp(directory: Path, name: str, payload: bytes) -> Path:
+    """Write payload to a fsync-ed temporary file next to the target."""
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return Path(tmp)
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    """Replace ``path`` with ``data`` atomically."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _dump(data)  # serialize first: a TypeError must not leave a temp file
+    tmp = _write_temp(path.parent, path.name, payload)
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def atomic_create_json(path: Path, data: Any) -> None:
+    """Create ``path`` atomically; raise FileExistsError if it already exists."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _write_temp(path.parent, path.name, _dump(data))
+    try:
+        os.link(tmp, path)  # fails instead of overwriting
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+
+
+def load_history(smartpar_dir: Path) -> History:
+    """Read history.json; an absent file is an empty history."""
+    path = Path(smartpar_dir) / HISTORY_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return History()
+    try:
+        return History.from_dict(json.loads(raw))
+    except json.JSONDecodeError as exc:
+        raise SchemaError(f"{path}: invalid JSON: {exc}") from exc
+
+
+def save_history(smartpar_dir: Path, history: History) -> None:
+    atomic_write_json(Path(smartpar_dir) / HISTORY_FILE, history.to_dict())
+
+
+def new_run_id(pid: int | None = None, now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    return f"run_{now.strftime('%Y%m%dT%H%M%S%fZ')}_{pid if pid is not None else os.getpid()}"
+
+
+def write_run(smartpar_dir: Path, record: RunRecord) -> Path:
+    """Write a run file under runs/ without touching history.json.
+
+    The name comes from ``record.run_id``; if that name is taken (same pid,
+    same microsecond), a numeric suffix is appended and ``run_id`` updated.
+    """
+    runs = Path(smartpar_dir) / RUNS_DIR
+    base = record.run_id
+    for attempt in range(1000):
+        if attempt:
+            record.run_id = f"{base}_{attempt}"
+        path = runs / f"{record.run_id}.json"
+        try:
+            atomic_create_json(path, record.to_dict())
+        except FileExistsError:
+            continue
+        return path
+    raise RuntimeError(f"cannot find a free run file name for {base}")
+
+
+def iter_run_files(smartpar_dir: Path) -> Iterator[Path]:
+    yield from sorted((Path(smartpar_dir) / RUNS_DIR).glob("run_*.json"))
+
+
+def apply_run(history: History, run: RunRecord, alpha: float) -> None:
+    """Fold one run into the history (EMA of durations, counters).
+
+    The first observation of a test initializes its EMA. Skipped tests update
+    the counters but not the EMA: their duration says nothing about the cost
+    of actually running them.
+    """
+    for rec in run.tests:
+        entry = history.tests.setdefault(
+            rec.nodeid,
+            TestHistory(duration_ema=0.0, runs=0, last_outcome="", fail_count=0, timed_runs=0),
+        )
+        if rec.outcome != "skipped":
+            if entry.timed_runs == 0:
+                entry.duration_ema = rec.duration
+            else:
+                entry.duration_ema = alpha * rec.duration + (1 - alpha) * entry.duration_ema
+            entry.timed_runs += 1
+        entry.runs += 1
+        entry.last_outcome = rec.outcome
+        entry.fail_count += int(rec.outcome in FAILED_OUTCOMES)
+    if run.worker_startup_s is not None:
+        prev = history.overhead.get("worker_startup_s")
+        history.overhead["worker_startup_s"] = (
+            run.worker_startup_s
+            if prev is None
+            else alpha * run.worker_startup_s + (1 - alpha) * prev
+        )
+
+
+@dataclass
+class MergeResult:
+    merged: list[str] = field(default_factory=list)
+    already_merged: list[str] = field(default_factory=list)
+    invalid: list[Path] = field(default_factory=list)
+
+
+@contextlib.contextmanager
+def _merge_lock(smartpar_dir: Path) -> Iterator[None]:
+    """Serialize concurrent ``smartpar merge`` calls (normal runs never take it)."""
+    if fcntl is None:  # pragma: no cover
+        yield
+        return
+    Path(smartpar_dir).mkdir(parents=True, exist_ok=True)
+    with open(Path(smartpar_dir) / MERGE_LOCK, "w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _run_sort_key(run: RunRecord) -> tuple[datetime, str]:
+    started = datetime.fromisoformat(run.started_at)
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return started, run.run_id
+
+
+def merge(smartpar_dir: Path, alpha: float = DEFAULT_ALPHA) -> MergeResult:
+    """Fold all pending run files into history.json and move them to runs/merged/.
+
+    Crash safety: history.json is written (with the list of merged run ids)
+    *before* the run files are moved. If the process dies in between, the next
+    merge recognizes those runs by id and only moves them.
+    """
+    if not 0 < alpha <= 1:
+        raise ValueError(f"alpha must be in (0, 1], got {alpha}")
+    smartpar_dir = Path(smartpar_dir)
+    result = MergeResult()
+    with _merge_lock(smartpar_dir):
+        history = load_history(smartpar_dir)
+        previously_merged = set(history.last_merged_runs)
+        pending: list[tuple[RunRecord, Path]] = []
+        leftovers: list[Path] = []
+        for path in iter_run_files(smartpar_dir):
+            try:
+                run = RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, SchemaError, UnicodeDecodeError) as exc:
+                log.warning("smartpar: skipping invalid run file %s: %s", path, exc)
+                result.invalid.append(path)
+                continue
+            if run.run_id in previously_merged:
+                leftovers.append(path)
+                result.already_merged.append(run.run_id)
+            else:
+                pending.append((run, path))
+
+        pending.sort(key=lambda item: _run_sort_key(item[0]))
+        for run, _path in pending:
+            apply_run(history, run, alpha)
+            result.merged.append(run.run_id)
+
+        if pending:
+            history.last_merged_runs = list(result.merged)
+            save_history(smartpar_dir, history)
+
+        merged_dir = smartpar_dir / RUNS_DIR / MERGED_DIR
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        for path in [p for _r, p in pending] + leftovers:
+            os.replace(path, merged_dir / path.name)
+    return result
