@@ -64,14 +64,16 @@ jobs:
       - name: Demonstration run (profile, detect, run)
         working-directory: examples/control_project
         run: |
-          python -m pytest --smartpar-profile -q
+          # The two NOD tests fail with ~20 % probability by design, so a run
+          # that executes them may exit with 1 (= some tests failed). Any other
+          # exit code (usage error, internal error, ...) fails the step. The
+          # end-to-end test above checks that nothing but NOD tests fails.
+          tests_may_fail() { "$@" || [ $? -eq 1 ]; }
+          tests_may_fail python -m pytest --smartpar-profile -q
           python -m pytest --smartpar-detect --smartpar-seed 2026 -q
-          # The two NOD tests fail with ~20 % probability by design, so the
-          # exit code of these runs is not checked here; the end-to-end test
-          # above checks that nothing else fails.
-          python -m pytest -n 4 --smartpar -q || true
+          tests_may_fail python -m pytest -n 4 --smartpar -q
           smartpar --dir .smartpar merge
-          python -m pytest -n 4 --smartpar -q || true
+          tests_may_fail python -m pytest -n 4 --smartpar -q
           smartpar --dir .smartpar show
       - uses: actions/upload-artifact@v4
         with:
