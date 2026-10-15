@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-smartpar"
+version = "0.1.0.dev0"
+description = "Dependency-aware parallel execution of unit tests in CI (pytest-xdist plugin)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+classifiers = [
+    "Framework :: Pytest",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "pytest>=8",
+    # The scheduler interface of xdist is internal. The upper bound is pinned to the
+    # versions that are covered by tests (see tests for xdist_scheduling, phase 5).
+    "pytest-xdist>=3.6,<3.9",
+    "pytest-randomly>=3.15",
+]
+
+[project.optional-dependencies]
+bench = ["matplotlib>=3.7", "pyyaml>=6", "numpy>=1.24"]
+dev = ["ruff>=0.6"]
+
+[project.entry-points.pytest11]
+smartpar = "smartpar.plugin"
+
+[project.scripts]
+smartpar = "smartpar.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smartpar"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+# pytester runs pytest sessions in-process; the order of the tool's own tests
+# must be deterministic, so pytest-randomly is disabled here.
+addopts = "-p pytester -p no:randomly"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
