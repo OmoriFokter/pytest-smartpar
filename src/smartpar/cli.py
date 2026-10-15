@@ -17,7 +17,7 @@ from smartpar.profiler import CACHE_GROWTH, load_dependencies
 
 # Subcommand -> (help, implementation phase) for those that do not work yet.
 _UNIMPLEMENTED = {
-    "report": ("Print metrics of recorded runs.", 5),
+    "report": ("Print metrics of recorded runs.", 8),
 }
 
 
