@@ -70,3 +70,22 @@ def test_unsupported_xdist_selects_fallback(monkeypatch: pytest.MonkeyPatch) -> 
     assert "outside the tested range" in plugin.custom_scheduler_problem()
     monkeypatch.setattr(xdist, "__version__", "3.2.1")
     assert "outside the tested range" in plugin.custom_scheduler_problem()
+
+
+def test_readme_documents_every_public_option(pytester: pytest.Pytester) -> None:
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+    config = pytester.parseconfig()
+    group = next(g for g in config._parser._groups if g.name == "smartpar")
+    internal = {"--smartpar-child-report", "--smartpar-child-audit"}
+    flags = {name for opt in group.options for name in opt.names() if name.startswith("--")}
+    assert flags - internal, "no options found"
+    for flag in sorted(flags - internal):
+        assert f"`{flag}" in readme, f"{flag} is not documented in README.md"
+    for ini in (
+        "smartpar_ignore_state",
+        "smartpar_max_pair_checks",
+        "smartpar_max_orders_per_victim",
+    ):
+        assert f"`{ini}`" in readme
+    for command in ("smartpar merge", "smartpar show", "smartpar report"):
+        assert command in readme

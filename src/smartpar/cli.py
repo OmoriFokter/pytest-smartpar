@@ -8,17 +8,13 @@ polluters and the recommended number of workers).
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
 from smartpar import __version__, history, scheduler
 from smartpar.models import SchemaError
 from smartpar.profiler import CACHE_GROWTH, load_dependencies
-
-# Subcommand -> (help, implementation phase) for those that do not work yet.
-_UNIMPLEMENTED = {
-    "report": ("Print metrics of recorded runs.", 8),
-}
 
 
 def _alpha(text: str) -> float:
@@ -49,8 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="upper bound for the recommended m (default: available CPUs)",
     )
-    for name, (help_text, _phase) in _UNIMPLEMENTED.items():
-        sub.add_parser(name, help=help_text)
+    report = sub.add_parser("report", help="Summary of recorded runs (report.csv).")
+    report.add_argument("--last", type=int, default=10, help="number of runs (default: 10)")
     return parser
 
 
@@ -144,18 +140,41 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    path = Path(args.dir) / "report.csv"
+    if not path.exists():
+        print(f"smartpar report: {path} not found; run pytest -n m --smartpar first")
+        return 1
+    with open(path, newline="", encoding="utf-8") as fh:
+        totals = [row for row in csv.DictReader(fh) if row["worker_id"] == "ALL"]
+    columns = [
+        ("run_id", "run"),
+        ("mode", "mode"),
+        ("workers", "m"),
+        ("wall_time_s", "wall, s"),
+        ("predicted_wall_s", "predicted, s"),
+        ("prediction_error_pct", "error, %"),
+        ("failures_before_rerun", "failed before"),
+        ("failures_after_rerun", "failed after"),
+        ("reruns", "re-runs"),
+        ("tail_mode", "tail"),
+    ]
+    rows = [[row.get(key, "") or "-" for key, _ in columns] for row in totals[-args.last :]]
+    widths = [max(len(title), *(len(r[i]) for r in rows)) for i, (_, title) in enumerate(columns)]
+    print("  ".join(title.ljust(w) for (_, title), w in zip(columns, widths, strict=True)))
+    for r in rows:
+        print("  ".join(v.ljust(w) for v, w in zip(r, widths, strict=True)))
+    print(f"({len(rows)} of {len(totals)} runs in {path})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "merge":
         return cmd_merge(args)
     if args.command == "show":
         return cmd_show(args)
-    _help, phase = _UNIMPLEMENTED[args.command]
-    print(
-        f"smartpar {args.command}: not implemented yet (planned in phase {phase}).",
-        file=sys.stderr,
-    )
-    return 2
+    return cmd_report(args)
 
 
 if __name__ == "__main__":

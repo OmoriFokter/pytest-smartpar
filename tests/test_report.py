@@ -132,3 +132,18 @@ def test_replanning_for_a_different_worker_count(pytester: pytest.Pytester) -> N
     # LPT for 3 workers: 5 | 4 + 2 + 1 ... deterministic loads.
     assert sorted(plan["predicted_loads"].values()) == [6.0, 7.0, 7.0]
     assert plan["predicted_lpt_makespan_s"] == 7.0
+
+
+def test_cli_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from smartpar import cli
+
+    assert cli.main(["--dir", str(tmp_path), "report"]) == 1
+    rows = report_rows(run_record(), History())
+    append_report_csv(tmp_path / "report.csv", rows)
+    append_report_csv(tmp_path / "report.csv", report_rows(run_record(run_id="r2"), History()))
+    capsys.readouterr()
+    assert cli.main(["--dir", str(tmp_path), "report", "--last", "1"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].split()[:3] == ["run", "mode", "m"]
+    assert out[1].split()[:4] == ["r2", "smartpar", "2", "2.5000"]
+    assert out[-1].startswith("(1 of 2 runs")

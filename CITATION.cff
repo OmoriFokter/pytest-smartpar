@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite the article below (preferred) and/or
+  this software.
+title: "pytest-smartpar: dependency-aware parallel execution of unit tests in CI"
+type: software
+version: 0.1.0.dev0
+license: MIT
+abstract: >-
+  pytest plugin implementing a method for parallel execution of unit tests in
+  continuous integration systems: profiling of file access and process state,
+  detection of order-dependent tests, grouping by Bernstein's conditions and
+  confirmed order dependencies, LPT scheduling on pytest-xdist workers.
+keywords:
+  - pytest
+  - parallel testing
+  - continuous integration
+  - order-dependent tests
+  - LPT scheduling
+authors:
+  - family-names: Paryiskyi
+    given-names: Valerii
+  # Placeholders: replace with the co-authors' names before publication.
+  - family-names: "<Прізвище 2>"
+    given-names: "<Ім'я 2>"
+  - family-names: "<Прізвище 3>"
+    given-names: "<Ім'я 3>"
+preferred-citation:
+  type: article
+  status: in-preparation
+  title: "Метод паралельного виконання модульних тестів у системах безперервної інтеграції"
+  journal: "АСУ та прилади автоматики"
+  authors:
+    - family-names: Paryiskyi
+      given-names: Valerii
+    - family-names: "<Прізвище 2>"
+      given-names: "<Ім'я 2>"
+    - family-names: "<Прізвище 3>"
+      given-names: "<Ім'я 3>"
