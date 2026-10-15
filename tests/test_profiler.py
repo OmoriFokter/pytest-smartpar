@@ -466,6 +466,11 @@ def run_profile(
     return pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider", *args)
 
 
+def rw_only(access: dict) -> dict:
+    """R/W/W_tree of a file_access entry, without its source map."""
+    return {k: v for k, v in access.items() if k != "source"}
+
+
 def load(pytester: pytest.Pytester, name: str) -> dict:
     return json.loads((pytester.path / ".smartpar" / name).read_text())
 
@@ -480,8 +485,12 @@ def test_profile_serial(profiled_project: pytest.Pytester, monkeypatch: pytest.M
     deps = load(profiled_project, "dependencies.json")
     access = deps["file_access"]
     assert access[NODE + "test_write"]["W"] == ["<project>/build", "<project>/build/cfg.ini"]
-    assert access[NODE + "test_read"] == {"R": ["<project>/build/cfg.ini"], "W": [], "W_tree": []}
-    assert access[NODE + "test_copy_and_remove"] == {
+    assert rw_only(access[NODE + "test_read"]) == {
+        "R": ["<project>/build/cfg.ini"],
+        "W": [],
+        "W_tree": [],
+    }
+    assert rw_only(access[NODE + "test_copy_and_remove"]) == {
         "R": ["<project>/README.txt"],
         "W": ["<project>/build_copy.txt"],
         "W_tree": [],
@@ -743,7 +752,7 @@ def test_profile_directory_operations(pytester: pytest.Pytester) -> None:
     result = pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
     result.assert_outcomes(passed=6)
     deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
-    access = {k.split("::")[1]: v for k, v in deps["file_access"].items()}
+    access = {k.split("::")[1]: rw_only(v) for k, v in deps["file_access"].items()}
     assert access["test_a_create_new_dir"] == {
         "R": [],
         "W": ["<project>/out", "<project>/out/new"],

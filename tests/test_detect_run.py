@@ -202,3 +202,43 @@ def test_nod_on_plain_random_is_detected_with_distinct_isolation_seeds(
     assert meta["truncated_victims"] == 0
     assert meta["ordered_seed_start"] == 510  # right after the random-run seeds
     assert meta["ordered_runs"] >= 3
+
+
+CONDITIONAL = """
+import os
+
+def test_a_read_if_exists():
+    if os.path.exists("data.txt"):  # conditional access
+        open("data.txt").read()
+
+def test_b_write():
+    with open("data.txt", "w") as fh:
+        fh.write("x")
+"""
+
+
+def test_detector_runs_add_file_accesses_missed_by_profiling(pytester: pytest.Pytester) -> None:
+    pytester.makepyfile(test_cond=CONDITIONAL)
+    pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:randomly", timeout=TIMEOUT)
+    after_profile = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
+    assert after_profile["conflicts"] == []  # the reader ran first: nothing was opened
+    (pytester.path / "data.txt").unlink()  # start the detector from the same clean state
+
+    result = pytester.runpytest_subprocess(
+        "--smartpar-detect", "--smartpar-seed", "7", "--smartpar-runs", "8", timeout=TIMEOUT
+    )
+    assert result.ret == 0
+    deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
+    reader = deps["file_access"]["test_cond.py::test_a_read_if_exists"]
+    assert reader["R"] == ["<project>/data.txt"]
+    assert reader["source"]["R"] == {"<project>/data.txt": "detect"}
+    writer = deps["file_access"]["test_cond.py::test_b_write"]
+    assert writer["source"]["W"] == {"<project>/data.txt": "profile"}
+    assert [(c["a"], c["b"], c["kind"]) for c in deps["conflicts"]] == [
+        ("test_cond.py::test_a_read_if_exists", "test_cond.py::test_b_write", "R-W")
+    ]
+
+    # Profiling again keeps what only the detector saw.
+    pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:randomly", timeout=TIMEOUT)
+    again = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
+    assert len(again["conflicts"]) == 1

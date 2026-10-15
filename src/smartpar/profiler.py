@@ -45,6 +45,9 @@ import pytest
 from smartpar.graph import build as build_graph
 from smartpar.history import atomic_write_json, load_flaky, load_history
 from smartpar.models import (
+    ACCESS_KINDS,
+    SOURCE_DETECT,
+    SOURCE_PROFILE,
     Dependencies,
     FileAccess,
     Flaky,
@@ -479,27 +482,53 @@ class ProfileData:
         self.collection_index.update(other.collection_index)
 
 
+def access_from_raw(
+    raw: dict[str, dict[str, list[str]]], root: Path, source: str
+) -> dict[str, FileAccess]:
+    """{nodeid: {"R"|"W"|"W_tree": [absolute paths]}} -> FileAccess with resources."""
+    out: dict[str, FileAccess] = {}
+    for nodeid, kinds in raw.items():
+        access = out.setdefault(nodeid, FileAccess())
+        for kind in ACCESS_KINDS:
+            for path in kinds.get(kind, []):
+                access.add(kind, to_resource(path, root), source)
+    return out
+
+
+def merge_access(target: dict[str, FileAccess], extra: dict[str, FileAccess]) -> None:
+    """Add the accesses of ``extra`` (with their sources) to ``target``."""
+    for nodeid, access in extra.items():
+        dest = target.setdefault(nodeid, FileAccess())
+        for kind in ACCESS_KINDS:
+            for resource in getattr(access, kind):
+                dest.add(kind, resource, access.source(kind, resource))
+
+
 def build_dependencies(
     profile: ProfileData,
     root: Path,
     flaky: Flaky | None,
     history: History,
     extra_stats: dict[str, Any],
+    previous: Dependencies | None = None,
 ) -> Dependencies:
     """Fresh file access and state changes plus the derived graph.
 
-    Order edges mirror the confirmed pairs of flaky.json (none without it).
-    Groups here are informational (durations as known at profiling time, NOD
-    tests isolated); the plan recomputes them for the collected tests.
+    Accesses seen only in the detector's runs (source "detect") are kept from
+    ``previous``: one profiling run in one order does not see conditional
+    accesses that other orders trigger. Order edges mirror the confirmed pairs
+    of flaky.json (none without it). Groups here are informational; the plan
+    recomputes them for the collected tests.
     """
-    file_access = {
-        nodeid: FileAccess(
-            R=sorted({to_resource(p, root) for p in rw["R"]}),
-            W=sorted({to_resource(p, root) for p in rw["W"]}),
-            W_tree=sorted({to_resource(p, root) for p in rw["W_tree"]}),
+    file_access = access_from_raw(profile.file_access, root, SOURCE_PROFILE)
+    if previous is not None:
+        merge_access(
+            file_access,
+            {n: a.only({SOURCE_DETECT}) for n, a in previous.file_access.items()},
         )
-        for nodeid, rw in profile.file_access.items()
-    }
+        file_access = {
+            n: a for n, a in file_access.items() if any(getattr(a, k) for k in ACCESS_KINDS)
+        }
     tests = set(profile.file_access) | set(profile.state_changes)
     durations = estimate_durations(tests, history).durations
     edges = flaky.order_edges() if flaky else []
@@ -540,6 +569,59 @@ def load_dependencies(smartpar_dir: Path) -> Dependencies | None:
 # --- pytest integration -------------------------------------------------------------
 
 
+def venv_dirs() -> list[Path]:
+    return [Path(p) for p in {sys.prefix, sys.base_prefix, sys.exec_prefix} if p]
+
+
+def ignore_dirs(config: pytest.Config) -> list[str]:
+    """Directories whose files are not recorded (interpreter, tmp_path, /dev ...)."""
+    dirs = [str(p) for p in venv_dirs()]
+    dirs += [sys.base_exec_prefix, "/dev", "/proc", "/sys"]
+    factory = getattr(config, "_tmp_path_factory", None)
+    if factory is not None:
+        with contextlib.suppress(Exception):
+            dirs.append(str(factory.getbasetemp()))
+    return dirs
+
+
+class AuditOnlyPlugin:
+    """File access recording without state snapshots (detector child runs)."""
+
+    def __init__(self, config: pytest.Config) -> None:
+        self.config = config
+        self.recorder = FileAccessRecorder()
+
+    def pytest_sessionstart(self, session: pytest.Session) -> None:
+        self.recorder.set_ignore_dirs(ignore_dirs(self.config))
+        activate(self.recorder)
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_protocol(
+        self, item: pytest.Item, nextitem: pytest.Item | None
+    ) -> Generator[None, object, object]:
+        self.recorder.current = item.nodeid
+        try:
+            return (yield)
+        finally:
+            self.recorder.current = None
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_sessionfinish(self, session: pytest.Session) -> None:
+        activate(None)
+
+    def resources(self) -> dict[str, dict[str, list[str]]]:
+        """Accesses as resources of this session's root (``<project>/...``), so a
+        run in a project copy reports the same names as the project itself."""
+        root = Path(self.config.rootpath)
+        return {
+            nodeid: {
+                kind: sorted({to_resource(p, root) for p in paths})
+                for kind, paths in zip(ACCESS_KINDS, sets, strict=True)
+            }
+            for nodeid, sets in self.recorder.access.items()
+        }
+
+
 class ProfilerPlugin:
     """Active in ``--smartpar-profile`` mode in every pytest process.
 
@@ -566,16 +648,10 @@ class ProfilerPlugin:
 
     @staticmethod
     def _venv_dirs() -> list[Path]:
-        return [Path(p) for p in {sys.prefix, sys.base_prefix, sys.exec_prefix} if p]
+        return venv_dirs()
 
     def _ignore_dirs(self) -> list[str]:
-        dirs = [str(p) for p in self._venv_dirs()]
-        dirs += [sys.base_exec_prefix, "/dev", "/proc", "/sys"]
-        factory = getattr(self.config, "_tmp_path_factory", None)
-        if factory is not None:
-            with contextlib.suppress(Exception):
-                dirs.append(str(factory.getbasetemp()))
-        return dirs
+        return ignore_dirs(self.config)
 
     # Called from pytest_configure_node, see plugin._XdistProfileHooks.
     def configure_node(self, node: Any) -> None:
@@ -644,5 +720,7 @@ class ProfilerPlugin:
         except SchemaError as exc:
             log.warning("smartpar: ignoring unreadable data file: %s", exc)
             flaky, hist = None, History()
-        deps = build_dependencies(profile, self.root, flaky, hist, {"mode": mode})
+        deps = build_dependencies(
+            profile, self.root, flaky, hist, {"mode": mode}, load_dependencies(self.smartpar_dir)
+        )
         atomic_write_json(self.smartpar_dir / DEPENDENCIES_FILE, deps.to_dict())

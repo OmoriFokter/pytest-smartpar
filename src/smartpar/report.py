@@ -17,6 +17,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -130,15 +131,25 @@ class ProfileRunWriter:
 
 
 class ChildReportWriter:
-    """In a child pytest process (re-run, tail pass): dump the record as JSON."""
+    """In a child pytest process (re-run, tail pass, detector run): dump the
+    record as JSON, plus the file accesses when an audit plugin is given."""
 
-    def __init__(self, collector: RunCollector, path: Path) -> None:
+    def __init__(
+        self,
+        collector: RunCollector,
+        path: Path,
+        file_access: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
         self.collector = collector
         self.path = path
+        self.file_access = file_access
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session: pytest.Session) -> None:
-        history.atomic_write_json(self.path, self.collector.record().to_dict())
+        data = self.collector.record().to_dict()
+        if self.file_access is not None:
+            data["file_access"] = self.file_access()
+        history.atomic_write_json(self.path, data)
 
 
 # --- plan.json ----------------------------------------------------------------------

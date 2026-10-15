@@ -44,7 +44,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from smartpar.models import FAILED_OUTCOMES, Flaky, RunRecord
+from smartpar.models import (
+    ACCESS_KINDS,
+    FAILED_OUTCOMES,
+    SOURCE_DETECT,
+    FileAccess,
+    Flaky,
+    RunRecord,
+)
 
 log = logging.getLogger("smartpar.detector")
 
@@ -382,6 +389,9 @@ class ProcessRunner:
     ordered_seed_start: int = 0
     ordered_seeds_used: int = 0
     child_runs: int = 0
+    # File accesses seen in any child run (audit hook only, no snapshots):
+    # a random order can trigger accesses the profiling order did not.
+    file_access: dict[str, FileAccess] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -445,6 +455,7 @@ class ProcessRunner:
                 "--rootdir",
                 str(project),
                 f"--smartpar-child-report={report}",
+                "--smartpar-child-audit",
                 f"--basetemp={workdir / 'basetemp'}",
                 *opts,
             ]
@@ -472,9 +483,11 @@ class ProcessRunner:
             with self._lock:
                 self.child_runs += 1
             try:
-                record = RunRecord.from_dict(json.loads(report.read_text(encoding="utf-8")))
+                data = json.loads(report.read_text(encoding="utf-8"))
+                record = RunRecord.from_dict(data)
             except (OSError, ValueError):
                 return RunResult({}, [], proc.returncode)  # crashed: nothing ran
+            self._collect_access(data.get("file_access", {}))
             ordered = sorted(record.tests, key=lambda t: t.start)
             return RunResult(
                 {t.nodeid: t.outcome for t in record.tests},
@@ -485,6 +498,14 @@ class ProcessRunner:
             shutil.rmtree(workdir, ignore_errors=True)
             if not self.sandbox.in_place:
                 shutil.rmtree(project, ignore_errors=True)
+
+    def _collect_access(self, raw: dict[str, dict[str, list[str]]]) -> None:
+        with self._lock:
+            for nodeid, kinds in raw.items():
+                access = self.file_access.setdefault(nodeid, FileAccess())
+                for kind in ACCESS_KINDS:
+                    for resource in kinds.get(kind, []):
+                        access.add(kind, resource, SOURCE_DETECT)
 
     def _ini_in(self, project: Path) -> Path | None:
         if self.inipath is None:

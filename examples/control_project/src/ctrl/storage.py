@@ -17,10 +17,16 @@ def write_text(name: str, content: str, append: bool = False) -> None:
 
 
 def read_text(name: str) -> str | None:
-    # Always open (no exists() check): the access to the path is the same
-    # whether or not the file is there yet.
     try:
         with open(OUTPUT / name) as fh:
             return fh.read()
     except FileNotFoundError:
         return None
+
+
+def read_text_if_exists(name: str) -> str | None:
+    """Reads only when the file is already there (a conditional access)."""
+    path = OUTPUT / name
+    if not path.exists():
+        return None
+    return path.read_text()

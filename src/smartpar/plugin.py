@@ -32,12 +32,21 @@ from smartpar.detector import (
     choose_seeds,
 )
 from smartpar.graph import build as build_graph
-from smartpar.models import FAILED_OUTCOMES, Dependencies, Flaky, History, SchemaError
+from smartpar.models import (
+    FAILED_OUTCOMES,
+    Dependencies,
+    FileAccess,
+    Flaky,
+    History,
+    SchemaError,
+)
 from smartpar.profiler import (
     DEFAULT_IGNORE_STATE,
     DEPENDENCIES_FILE,
+    AuditOnlyPlugin,
     ProfilerPlugin,
     load_dependencies,
+    merge_access,
 )
 from smartpar.report import (
     ChildReportWriter,
@@ -181,6 +190,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Internal: write the run record of this (child) session to this JSON file.",
     )
     group.addoption(
+        "--smartpar-child-audit",
+        action="store_true",
+        default=False,
+        help="Internal: record file accesses (audit hook only) in the child report.",
+    )
+    group.addoption(
         "--smartpar-dir",
         default=".smartpar",
         help="Directory for smartpar data files (default: .smartpar).",
@@ -234,8 +249,16 @@ def pytest_configure(config: pytest.Config) -> None:
     if config.getoption("smartpar_child_report"):
         collector = RunCollector("child", 1, config.stash[RANDOMLY_REORDER_DISABLED])
         config.pluginmanager.register(collector, "smartpar-run-collector")
+        audit = None
+        if config.getoption("smartpar_child_audit"):
+            audit = AuditOnlyPlugin(config)
+            config.pluginmanager.register(audit, "smartpar-child-audit")
         config.pluginmanager.register(
-            ChildReportWriter(collector, Path(config.getoption("smartpar_child_report"))),
+            ChildReportWriter(
+                collector,
+                Path(config.getoption("smartpar_child_report")),
+                audit.resources if audit else None,
+            ),
             "smartpar-child-report",
         )
     if config.getoption("smartpar_profile"):
@@ -799,7 +822,7 @@ def run_detection(
     }
     flaky.detector = meta
     hist_io.atomic_write_json(smartpar_dir / hist_io.FLAKY_FILE, flaky.to_dict())
-    _update_dependencies(smartpar_dir, flaky, nodeids)
+    _update_dependencies(smartpar_dir, flaky, nodeids, runner.file_access)
     return flaky, meta
 
 
@@ -814,9 +837,16 @@ def _ini_int(config: pytest.Config, name: str) -> int:
     return value
 
 
-def _update_dependencies(smartpar_dir: Path, flaky: Flaky, nodeids: list[str]) -> None:
-    """Mirror the confirmed pairs into dependencies.json and rebuild groups."""
+def _update_dependencies(
+    smartpar_dir: Path,
+    flaky: Flaky,
+    nodeids: list[str],
+    detect_access: dict[str, FileAccess],
+) -> None:
+    """Mirror the confirmed pairs into dependencies.json, add the file accesses
+    seen in the detector's runs (source "detect") and rebuild the graph."""
     deps = load_dependencies(smartpar_dir) or Dependencies()
+    merge_access(deps.file_access, detect_access)
     hist = hist_io.load_history(smartpar_dir)
     tests = set(nodeids) | set(deps.file_access) | set(deps.state_changes)
     durations = estimate_durations(tests, hist).durations

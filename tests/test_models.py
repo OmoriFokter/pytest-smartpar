@@ -191,3 +191,26 @@ def test_overhead_needs_three_clean_runs_per_point() -> None:
     model.refit()
     assert (model.fit_points, model.kind) == ([], "default")
     assert (model.a, model.b) == (DEFAULT_OVERHEAD_A, DEFAULT_OVERHEAD_B)
+
+
+def test_file_access_sources() -> None:
+    from smartpar.models import FileAccess
+
+    access = FileAccess()
+    access.add("R", "<project>/a", "profile")
+    access.add("R", "<project>/b", "detect")
+    access.add("R", "<project>/b", "profile")  # first source wins
+    access.add("W_tree", "<project>/d", "detect")
+    assert access.R == ["<project>/a", "<project>/b"]
+    assert (access.source("R", "<project>/a"), access.source("R", "<project>/b")) == (
+        "profile",
+        "detect",
+    )
+    assert access.only({"profile"}) == FileAccess(R=["<project>/a"])
+    assert access.only({"detect"}).W_tree == ["<project>/d"]
+    data = access.to_dict()
+    assert data["source"]["R"] == {"<project>/a": "profile", "<project>/b": "detect"}
+    from smartpar.models import Dependencies
+
+    deps = Dependencies(file_access={"t": access})
+    assert Dependencies.from_dict(roundtrip(deps.to_dict())).file_access["t"] == access

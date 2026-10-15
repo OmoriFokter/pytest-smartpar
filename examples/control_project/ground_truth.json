@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Everything planted in the control project. The method must find exactly the file_conflicts, od_pairs and brittle pairs (precision = recall = 1); NOD tests must never be reported as order-dependent; tests in restored_state must have no state_changes.",
+  "description": "Everything planted in the control project. The method must find exactly the file_conflicts, od_pairs and brittle pairs (precision = recall = 1); NOD tests must never be reported as order-dependent; tests in restored_state must have no state_changes. Conflicts marked hard_case=conditional_read are not visible to a single profiling run in the usual order (the reader skips open() when the file is missing); they must be found once the detector's runs are merged in.",
   "test_count": 200,
   "file_conflicts": [
     {
@@ -19,13 +19,15 @@
       "a": "tests/test_storage.py::test_c3_a_read_cache",
       "b": "tests/test_storage.py::test_c3_b_write_cache",
       "resource": "<project>/output/cache.bin",
-      "kind": "R-W"
+      "kind": "R-W",
+      "hard_case": "conditional_read"
     },
     {
       "a": "tests/test_storage.py::test_c4_a_read_log",
       "b": "tests/test_storage.py::test_c4_b_write_log",
       "resource": "<project>/output/app.log",
-      "kind": "R-W"
+      "kind": "R-W",
+      "hard_case": "conditional_read"
     },
     {
       "a": "tests/test_storage.py::test_c5_a_write_lock",

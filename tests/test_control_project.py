@@ -67,6 +67,7 @@ NOD = {n["test"] for n in GROUND_TRUTH["nod"]}
 @pytest.fixture(scope="module")
 def profiled(project: Path) -> Path:
     run(project, "--smartpar-profile")
+    shutil.copy(project / ".smartpar" / "dependencies.json", project / "deps_after_profile.json")
     return project
 
 
@@ -76,11 +77,33 @@ def detected(profiled: Path) -> Path:
     return profiled
 
 
-def test_file_conflicts_match_ground_truth(profiled: Path) -> None:
-    deps = data(profiled, "dependencies.json")
-    found = {(c["a"], c["b"], c["resource"], c["kind"]) for c in deps["conflicts"]}
-    expected = {(c["a"], c["b"], c["resource"], c["kind"]) for c in GROUND_TRUTH["file_conflicts"]}
-    assert precision_recall(found, expected) == (1.0, 1.0), found ^ expected
+def conflicts(deps: dict) -> set:
+    return {(c["a"], c["b"], c["resource"], c["kind"]) for c in deps["conflicts"]}
+
+
+EXPECTED_CONFLICTS = {
+    (c["a"], c["b"], c["resource"], c["kind"]) for c in GROUND_TRUTH["file_conflicts"]
+}
+HARD_CONFLICTS = {
+    (c["a"], c["b"], c["resource"], c["kind"])
+    for c in GROUND_TRUTH["file_conflicts"]
+    if c.get("hard_case") == "conditional_read"
+}
+
+
+def test_profiling_alone_misses_only_conditional_reads(profiled: Path) -> None:
+    found = conflicts(json.loads((profiled / "deps_after_profile.json").read_text()))
+    precision, _recall = precision_recall(found, EXPECTED_CONFLICTS)
+    assert precision == 1.0
+    assert found >= EXPECTED_CONFLICTS - HARD_CONFLICTS  # every ordinary conflict
+    # Conditional reads may be missed by one profiling run (here they are: each
+    # reader runs before its writer in the usual order).
+    assert EXPECTED_CONFLICTS - found <= HARD_CONFLICTS
+
+
+def test_profile_plus_detect_finds_all_conflicts(detected: Path) -> None:
+    found = conflicts(data(detected, "dependencies.json"))
+    assert precision_recall(found, EXPECTED_CONFLICTS) == (1.0, 1.0), found ^ EXPECTED_CONFLICTS
 
 
 def test_restored_state_is_not_reported(profiled: Path) -> None:

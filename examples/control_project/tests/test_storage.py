@@ -32,7 +32,8 @@ def test_c2_b_read_index():
 
 
 def test_c3_a_read_cache():
-    _complete_or_missing(storage.read_text("cache.bin"), "cache" * 40)
+    # Conditional read: before its writer (the usual order) nothing is opened.
+    _complete_or_missing(storage.read_text_if_exists("cache.bin"), "cache" * 40)
 
 
 def test_c3_b_write_cache():
@@ -40,7 +41,7 @@ def test_c3_b_write_cache():
 
 
 def test_c4_a_read_log():
-    content = storage.read_text("app.log")
+    content = storage.read_text_if_exists("app.log")  # conditional read
     assert content is None or all(line == "event" for line in content.splitlines())
 
 

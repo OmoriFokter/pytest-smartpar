@@ -332,6 +332,11 @@ class RunRecord:
 # --- dependencies.json -----------------------------------------------------------
 
 
+ACCESS_KINDS = ("R", "W", "W_tree")
+SOURCE_PROFILE = "profile"
+SOURCE_DETECT = "detect"
+
+
 @dataclass
 class FileAccess:
     R: list[str] = field(default_factory=list)
@@ -339,6 +344,39 @@ class FileAccess:
     # Directories whose whole subtree is written (rmtree, rmdir, rename/move of
     # a directory): conflicts with any access at or below the path.
     W_tree: list[str] = field(default_factory=list)
+    # Accesses seen only in the detector's child runs: kind -> {resource: "detect"}.
+    # Every other access has source "profile" (seen during profiling).
+    sources: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    def source(self, kind: str, resource: str) -> str:
+        return self.sources.get(kind, {}).get(resource, SOURCE_PROFILE)
+
+    def add(self, kind: str, resource: str, source: str) -> None:
+        """Record an access; an access already known keeps its first source."""
+        items: list[str] = getattr(self, kind)
+        if resource not in items:
+            items.append(resource)
+            items.sort()
+            if source != SOURCE_PROFILE:
+                self.sources.setdefault(kind, {})[resource] = source
+
+    def only(self, allowed: set[str]) -> FileAccess:
+        """The accesses observed by the given sources."""
+        out = FileAccess()
+        for kind in ACCESS_KINDS:
+            for resource in getattr(self, kind):
+                source = self.source(kind, resource)
+                if source in allowed:
+                    out.add(kind, resource, source)
+        return out
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {kind: sorted(getattr(self, kind)) for kind in ACCESS_KINDS}
+        data["source"] = {
+            kind: {r: self.source(kind, r) for r in sorted(getattr(self, kind))}
+            for kind in ACCESS_KINDS
+        }
+        return data
 
 
 def _str_list(value: Any, what: str) -> list[str]:
@@ -444,10 +482,7 @@ class Dependencies:
     def to_dict(self) -> dict[str, Any]:
         return {
             **envelope(),
-            "file_access": {
-                k: {"R": sorted(v.R), "W": sorted(v.W), "W_tree": sorted(v.W_tree)}
-                for k, v in sorted(self.file_access.items())
-            },
+            "file_access": {k: v.to_dict() for k, v in sorted(self.file_access.items())},
             "collection_index": dict(sorted(self.collection_index.items())),
             "state_changes": {k: sorted(v) for k, v in sorted(self.state_changes.items())},
             "conflicts": [asdict(c) for c in sorted(self.conflicts)],
@@ -464,12 +499,24 @@ class Dependencies:
         for nodeid, access in _get(data, "file_access", dict, what).items():
             if not isinstance(access, dict):
                 raise SchemaError(f"{what}: file_access {nodeid!r} is not an object")
+            sources = access.get("source", {})
+            if not isinstance(sources, dict) or not all(
+                isinstance(v, dict)
+                and all(src in (SOURCE_PROFILE, SOURCE_DETECT) for src in v.values())
+                for v in sources.values()
+            ):
+                raise SchemaError(f"{what}: file_access {nodeid!r} has an invalid source map")
             file_access[nodeid] = FileAccess(
                 R=_str_list(access.get("R"), f"{what}: file_access {nodeid!r} R"),
                 W=_str_list(access.get("W"), f"{what}: file_access {nodeid!r} W"),
                 W_tree=_str_list(
                     access.get("W_tree", []), f"{what}: file_access {nodeid!r} W_tree"
                 ),
+                sources={
+                    k: {r: src for r, src in v.items() if src != SOURCE_PROFILE}
+                    for k, v in sources.items()
+                    if any(src != SOURCE_PROFILE for src in v.values())
+                },
             )
         state_changes = {
             k: _str_list(v, f"{what}: state_changes {k!r}")
