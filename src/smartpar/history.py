@@ -29,6 +29,7 @@ from typing import Any
 from smartpar.models import (
     FAILED_OUTCOMES,
     UNTIMED_MODES,
+    Flaky,
     History,
     RunRecord,
     SchemaError,
@@ -43,6 +44,7 @@ except ImportError:  # pragma: no cover
 log = logging.getLogger("smartpar.history")
 
 HISTORY_FILE = "history.json"
+FLAKY_FILE = "flaky.json"
 RUNS_DIR = "runs"
 MERGED_DIR = "merged"
 MERGE_LOCK = ".merge.lock"
@@ -103,6 +105,19 @@ def load_history(smartpar_dir: Path) -> History:
         return History()
     try:
         return History.from_dict(json.loads(raw))
+    except json.JSONDecodeError as exc:
+        raise SchemaError(f"{path}: invalid JSON: {exc}") from exc
+
+
+def load_flaky(smartpar_dir: Path) -> Flaky | None:
+    """Read flaky.json; None if the detector has not run."""
+    path = Path(smartpar_dir) / FLAKY_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    try:
+        return Flaky.from_dict(json.loads(raw))
     except json.JSONDecodeError as exc:
         raise SchemaError(f"{path}: invalid JSON: {exc}") from exc
 

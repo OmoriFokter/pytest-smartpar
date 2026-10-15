@@ -477,6 +477,16 @@ def test_profile_serial(profiled_project: pytest.Pytester, monkeypatch: pytest.M
     }  # test_monkeypatch_restores is absent: restored state is not a change
     assert deps["profile_stats"]["errors"] == 0
     assert deps["profile_stats"]["mode"] == "serial"
+    # Only file conflicts create edges; state changes alone do not.
+    assert deps["conflicts"] == [
+        {
+            "a": NODE + "test_read",
+            "b": NODE + "test_write",
+            "kind": "R-W",
+            "resource": "<project>/build/cfg.ini",
+        }
+    ]
+    assert [g["tests"] for g in deps["groups"]] == [[NODE + "test_read", NODE + "test_write"]]
 
     hist = load(profiled_project, "history.json")
     assert len(hist["tests"]) == 12
@@ -511,12 +521,11 @@ def test_profile_parallel_matches_serial(
     assert run["randomly_reorder_disabled"] is True
 
 
-def test_profile_keeps_order_edges_and_drops_stale_derived_data(
+def test_profile_mirrors_flaky_edges_and_drops_stale_derived_data(
     profiled_project: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     smartpar_dir = profiled_project.path / ".smartpar"
     smartpar_dir.mkdir()
-    edge = {"before": "a", "after": "b", "reason": "victim-before-polluter"}
     (smartpar_dir / "dependencies.json").write_text(
         json.dumps(
             {
@@ -524,16 +533,35 @@ def test_profile_keeps_order_edges_and_drops_stale_derived_data(
                 "file_access": {"old::test": {"R": ["x"], "W": []}},
                 "state_changes": {},
                 "conflicts": [{"a": "old", "b": "old2", "resource": "x", "kind": "W-R"}],
-                "order_edges": [edge],
-                "groups": [{"id": "g0", "tests": ["old"]}],
+                "order_edges": [{"before": "old", "after": "old2", "reason": "stale"}],
+                "groups": [],
+            }
+        )
+    )
+    victim, polluter = NODE + "test_read", NODE + "test_pollute_dict"
+    (smartpar_dir / "flaky.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "runs": 20,
+                "seeds": [1],
+                "od_victims": [{"victim": victim, "polluters": [polluter]}],
+                "od_brittle": [],
+                "nod": [],
+                "unresolved": [],
             }
         )
     )
     run_profile(profiled_project, monkeypatch).assert_outcomes(passed=12)
     deps = load(profiled_project, "dependencies.json")
-    assert deps["order_edges"] == [edge]
-    assert deps["conflicts"] == [] and deps["groups"] == []
+    assert deps["order_edges"] == [
+        {"before": victim, "after": polluter, "reason": "victim-before-polluter"}
+    ]
     assert "old::test" not in deps["file_access"]
+    assert all(c["a"] != "old" for c in deps["conflicts"])
+    (group,) = deps["groups"]
+    assert group["reasons"] == ["file", "od"]
+    assert group["order"].index(victim) < group["order"].index(polluter)
 
 
 def test_no_profiling_without_flag(

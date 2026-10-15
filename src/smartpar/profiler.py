@@ -42,8 +42,18 @@ from typing import Any
 
 import pytest
 
-from smartpar.history import atomic_write_json
-from smartpar.models import Dependencies, FileAccess, SchemaError, check_version, envelope
+from smartpar.graph import build as build_graph
+from smartpar.history import atomic_write_json, load_flaky, load_history
+from smartpar.models import (
+    Dependencies,
+    FileAccess,
+    Flaky,
+    History,
+    SchemaError,
+    check_version,
+    envelope,
+)
+from smartpar.scheduler import estimate_durations
 
 log = logging.getLogger("smartpar.profiler")
 
@@ -446,11 +456,17 @@ class ProfileData:
 
 
 def build_dependencies(
-    profile: ProfileData, root: Path, previous: Dependencies | None, extra_stats: dict[str, Any]
+    profile: ProfileData,
+    root: Path,
+    flaky: Flaky | None,
+    history: History,
+    extra_stats: dict[str, Any],
 ) -> Dependencies:
-    """Fresh file access and state changes; order edges from the detector are kept.
+    """Fresh file access and state changes plus the derived graph.
 
-    Conflicts and groups are derived from file access, so stale ones are dropped.
+    Order edges mirror the confirmed pairs of flaky.json (none without it).
+    Groups here are informational (durations as known at profiling time, NOD
+    tests isolated); the plan recomputes them for the collected tests.
     """
     file_access = {
         nodeid: FileAccess(
@@ -459,10 +475,18 @@ def build_dependencies(
         )
         for nodeid, rw in profile.file_access.items()
     }
+    tests = set(profile.file_access) | set(profile.state_changes)
+    durations = estimate_durations(tests, history).durations
+    edges = flaky.order_edges() if flaky else []
+    graph = build_graph(
+        tests, file_access, edges, durations, isolate=flaky.nod_tests() if flaky else ()
+    )
     return Dependencies(
         file_access=file_access,
         state_changes={k: sorted(v) for k, v in profile.state_changes.items() if v},
-        order_edges=previous.order_edges if previous else [],
+        conflicts=graph.conflicts,
+        order_edges=graph.order_edges,
+        groups=graph.groups,
         profile_stats={
             **extra_stats,
             **profile.stats,
@@ -580,10 +604,11 @@ class ProfilerPlugin:
             mode = "serial"
         if not profile.file_access and not profile.state_changes:
             return  # nothing ran
-        deps = build_dependencies(
-            profile,
-            self.root,
-            load_dependencies(self.smartpar_dir),
-            {"mode": mode},
-        )
+        try:
+            flaky = load_flaky(self.smartpar_dir)
+            hist = load_history(self.smartpar_dir)
+        except SchemaError as exc:
+            log.warning("smartpar: ignoring unreadable data file: %s", exc)
+            flaky, hist = None, History()
+        deps = build_dependencies(profile, self.root, flaky, hist, {"mode": mode})
         atomic_write_json(self.smartpar_dir / DEPENDENCIES_FILE, deps.to_dict())

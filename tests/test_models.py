@@ -104,12 +104,14 @@ def test_not_an_object_rejected() -> None:
 
 
 def test_dependencies_roundtrip_and_validation() -> None:
-    from smartpar.models import Dependencies, FileAccess
+    from smartpar.models import Conflict, Dependencies, FileAccess, Group, OrderEdge
 
     deps = Dependencies(
         file_access={"t::a": FileAccess(R=["<project>/x"], W=[])},
         state_changes={"t::a": ["env:X"]},
-        order_edges=[{"before": "a", "after": "b", "reason": "r"}],
+        conflicts=[Conflict("t::a", "t::b", "<project>/x", "W-R")],
+        order_edges=[OrderEdge("a", "b", "r")],
+        groups=[Group("g0", ["t::a", "t::b"], ["t::b", "t::a"], 1.5, ["file"])],
         profile_stats={"errors": 0},
     )
     assert Dependencies.from_dict(roundtrip(deps.to_dict())) == deps
@@ -121,3 +123,28 @@ def test_dependencies_roundtrip_and_validation() -> None:
     bad["file_access"]["t::a"]["W"] = "x"
     with pytest.raises(SchemaError, match="list of strings"):
         Dependencies.from_dict(bad)
+
+
+def test_flaky_order_edges_and_validation() -> None:
+    from smartpar.models import Flaky, OrderEdge
+
+    data = {
+        "schema_version": 1,
+        "runs": 20,
+        "seeds": [101, 102],
+        "od_victims": [{"victim": "v", "polluters": ["p1", "p2"], "fail_rate": "4/20"}],
+        "od_brittle": [{"test": "b", "state_setters": ["s"], "fail_rate": "6/20"}],
+        "nod": [{"test": "n", "fail_rate": "2/20", "note": "x"}],
+        "unresolved": [],
+    }
+    flaky = Flaky.from_dict(data)
+    assert flaky.order_edges() == [
+        OrderEdge("s", "b", "setter-before-brittle"),
+        OrderEdge("v", "p1", "victim-before-polluter"),
+        OrderEdge("v", "p2", "victim-before-polluter"),
+    ]
+    assert flaky.nod_tests() == ["n"]
+    assert Flaky.from_dict(roundtrip(flaky.to_dict())) == flaky
+    data["od_victims"][0]["polluters"] = "p1"
+    with pytest.raises(SchemaError):
+        Flaky.from_dict(data)

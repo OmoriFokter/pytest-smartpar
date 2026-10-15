@@ -233,10 +233,77 @@ def _str_list(value: Any, what: str) -> list[str]:
     return list(value)
 
 
-def _dict_list(value: Any, what: str) -> list[dict[str, Any]]:
+def _obj_list(value: Any, what: str) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not all(isinstance(v, dict) for v in value):
         raise SchemaError(f"{what}: expected a list of objects")
     return list(value)
+
+
+CONFLICT_KINDS = frozenset({"W-R", "R-W", "W-W"})
+
+
+@dataclass(frozen=True, order=True)
+class Conflict:
+    """Tests ``a`` < ``b`` violate Bernstein's conditions on ``resource``.
+
+    ``kind`` is from a's side: "W-R" a writes and b reads, "R-W" the reverse,
+    "W-W" both write.
+    """
+
+    a: str
+    b: str
+    resource: str
+    kind: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], what: str) -> Conflict:
+        kind = _get(data, "kind", str, what)
+        if kind not in CONFLICT_KINDS:
+            raise SchemaError(f"{what}: unknown conflict kind {kind!r}")
+        return cls(
+            _get(data, "a", str, what),
+            _get(data, "b", str, what),
+            _get(data, "resource", str, what),
+            kind,
+        )
+
+
+@dataclass(frozen=True, order=True)
+class OrderEdge:
+    """``before`` must run before ``after`` when both run in one process."""
+
+    before: str
+    after: str
+    reason: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], what: str) -> OrderEdge:
+        return cls(
+            _get(data, "before", str, what),
+            _get(data, "after", str, what),
+            _get(data, "reason", str, what),
+        )
+
+
+@dataclass
+class Group:
+    """Tests linked by conflicts or order edges: one worker, ``order`` in sequence."""
+
+    id: str
+    tests: list[str]
+    order: list[str]
+    est_duration: float
+    reasons: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], what: str) -> Group:
+        return cls(
+            id=_get(data, "id", str, what),
+            tests=_str_list(_get(data, "tests", list, what), f"{what} tests"),
+            order=_str_list(_get(data, "order", list, what), f"{what} order"),
+            est_duration=float(_get(data, "est_duration", (int, float), what)),
+            reasons=_str_list(_get(data, "reasons", list, what), f"{what} reasons"),
+        )
 
 
 @dataclass
@@ -245,15 +312,14 @@ class Dependencies:
 
     Paths are resources: ``<project>/relative/path`` inside the project root,
     absolute paths outside it. ``conflicts`` and ``groups`` are derived by the
-    graph step, ``order_edges`` by the detector; they stay plain objects until
-    those phases define them.
+    graph step; ``order_edges`` mirror the confirmed pairs of flaky.json.
     """
 
     file_access: dict[str, FileAccess] = field(default_factory=dict)
     state_changes: dict[str, list[str]] = field(default_factory=dict)
-    conflicts: list[dict[str, Any]] = field(default_factory=list)
-    order_edges: list[dict[str, Any]] = field(default_factory=list)
-    groups: list[dict[str, Any]] = field(default_factory=list)
+    conflicts: list[Conflict] = field(default_factory=list)
+    order_edges: list[OrderEdge] = field(default_factory=list)
+    groups: list[Group] = field(default_factory=list)
     # Diagnostics of the profiling run: skipped/unresolved audit events,
     # modules snapshotted in cheap mode, etc.
     profile_stats: dict[str, Any] = field(default_factory=dict)
@@ -265,9 +331,9 @@ class Dependencies:
                 k: {"R": sorted(v.R), "W": sorted(v.W)} for k, v in sorted(self.file_access.items())
             },
             "state_changes": {k: sorted(v) for k, v in sorted(self.state_changes.items())},
-            "conflicts": self.conflicts,
-            "order_edges": self.order_edges,
-            "groups": self.groups,
+            "conflicts": [asdict(c) for c in sorted(self.conflicts)],
+            "order_edges": [asdict(e) for e in sorted(self.order_edges)],
+            "groups": [asdict(g) for g in self.groups],
             "profile_stats": self.profile_stats,
         }
 
@@ -292,8 +358,86 @@ class Dependencies:
         return cls(
             file_access=file_access,
             state_changes=state_changes,
-            conflicts=_dict_list(_get(data, "conflicts", list, what), f"{what}: conflicts"),
-            order_edges=_dict_list(_get(data, "order_edges", list, what), f"{what}: order_edges"),
-            groups=_dict_list(_get(data, "groups", list, what), f"{what}: groups"),
+            conflicts=[
+                Conflict.from_dict(c, f"{what}: conflict")
+                for c in _obj_list(_get(data, "conflicts", list, what), f"{what}: conflicts")
+            ],
+            order_edges=[
+                OrderEdge.from_dict(e, f"{what}: order edge")
+                for e in _obj_list(_get(data, "order_edges", list, what), f"{what}: order_edges")
+            ],
+            groups=[
+                Group.from_dict(g, f"{what}: group")
+                for g in _obj_list(_get(data, "groups", list, what), f"{what}: groups")
+            ],
             profile_stats=stats,
+        )
+
+
+# --- flaky.json --------------------------------------------------------------------
+
+VICTIM_BEFORE_POLLUTER = "victim-before-polluter"
+SETTER_BEFORE_BRITTLE = "setter-before-brittle"
+
+
+@dataclass
+class Flaky:
+    """flaky.json (spec 3.3); only confirmed pairs are ever written here.
+
+    Entries are kept as plain objects (the detector, phase 6, owns their
+    details); ``order_edges`` and ``nod_tests`` are what scheduling needs.
+    """
+
+    runs: int = 0
+    seeds: list[int] = field(default_factory=list)
+    od_victims: list[dict[str, Any]] = field(default_factory=list)
+    od_brittle: list[dict[str, Any]] = field(default_factory=list)
+    nod: list[dict[str, Any]] = field(default_factory=list)
+    unresolved: list[Any] = field(default_factory=list)
+
+    def order_edges(self) -> list[OrderEdge]:
+        """Victim before each of its polluters; each state setter before its brittle test."""
+        edges = {
+            OrderEdge(v["victim"], polluter, VICTIM_BEFORE_POLLUTER)
+            for v in self.od_victims
+            for polluter in v["polluters"]
+        }
+        edges |= {
+            OrderEdge(setter, b["test"], SETTER_BEFORE_BRITTLE)
+            for b in self.od_brittle
+            for setter in b["state_setters"]
+        }
+        return sorted(edges)
+
+    def nod_tests(self) -> list[str]:
+        return sorted(n["test"] for n in self.nod)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**envelope(), **asdict(self)}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Flaky:
+        what = "flaky.json"
+        data = check_version(data, what)
+        victims = _obj_list(_get(data, "od_victims", list, what), f"{what}: od_victims")
+        for v in victims:
+            _get(v, "victim", str, f"{what}: od_victims")
+            _str_list(_get(v, "polluters", list, f"{what}: od_victims"), f"{what}: polluters")
+        brittle = _obj_list(_get(data, "od_brittle", list, what), f"{what}: od_brittle")
+        for b in brittle:
+            _get(b, "test", str, f"{what}: od_brittle")
+            _str_list(_get(b, "state_setters", list, f"{what}: od_brittle"), f"{what}: setters")
+        nod = _obj_list(_get(data, "nod", list, what), f"{what}: nod")
+        for n in nod:
+            _get(n, "test", str, f"{what}: nod")
+        seeds = _get(data, "seeds", list, what)
+        if not all(isinstance(x, int) and not isinstance(x, bool) for x in seeds):
+            raise SchemaError(f"{what}: seeds must be integers")
+        return cls(
+            runs=_get(data, "runs", int, what),
+            seeds=list(seeds),
+            od_victims=victims,
+            od_brittle=brittle,
+            nod=nod,
+            unresolved=list(_get(data, "unresolved", list, what)),
         )

@@ -11,13 +11,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from smartpar import __version__, history
+from smartpar import __version__, history, scheduler
 from smartpar.models import SchemaError
+from smartpar.profiler import CACHE_GROWTH, load_dependencies
 
 # Subcommand -> (help, implementation phase) for those that do not work yet.
 _UNIMPLEMENTED = {
     "report": ("Print metrics of recorded runs.", 5),
-    "show": ("Show groups, polluters and the recommended number of workers.", 4),
 }
 
 
@@ -40,6 +40,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=history.DEFAULT_ALPHA,
         help=f"EMA smoothing factor (default: {history.DEFAULT_ALPHA})",
     )
+    show = sub.add_parser(
+        "show", help="Show groups, polluters and the recommended number of workers."
+    )
+    show.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="upper bound for the recommended m (default: available CPUs)",
+    )
     for name, (help_text, _phase) in _UNIMPLEMENTED.items():
         sub.add_parser(name, help=help_text)
     return parser
@@ -61,10 +70,87 @@ def cmd_merge(args: argparse.Namespace) -> int:
     return 1 if result.invalid else 0
 
 
+def _short(nodeid: str, width: int = 70) -> str:
+    return nodeid if len(nodeid) <= width else "..." + nodeid[-(width - 3) :]
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    directory = Path(args.dir)
+    try:
+        hist = history.load_history(directory)
+        flaky = history.load_flaky(directory)
+    except SchemaError as exc:
+        print(f"smartpar show: {exc}", file=sys.stderr)
+        return 1
+    deps = load_dependencies(directory)
+    tests = set(hist.tests) | (set(deps.file_access) | set(deps.state_changes) if deps else set())
+    if not tests:
+        print(f"smartpar show: no data in {directory}; run pytest --smartpar-profile first")
+        return 1
+    max_workers = args.max_workers or scheduler.available_cpus()
+    a = scheduler.analyze(tests, hist, deps, flaky, max_workers)
+    est, graph = a.estimates, a.graph
+
+    timed = len(tests) - len(est.estimated) - len(est.new_tests)
+    print(
+        f"tests: {len(tests)}  (timed: {timed}, estimated with median {est.median_s:.3f}s: "
+        f"{len(est.estimated)}, new: {len(est.new_tests)})"
+    )
+    if not est.has_timings:
+        print(
+            "  no measured durations yet: all estimates are equal; "
+            "the first `pytest -n auto --smartpar` run collects them"
+        )
+    print(f"file conflicts: {len(graph.conflicts)}")
+    print(f"order edges (confirmed): {len(graph.order_edges)}")
+
+    print(f"\ngroups ({len(graph.groups)}):")
+    for g in sorted(graph.groups, key=lambda g: (-g.est_duration, g.id)):
+        flag = "  OVERSIZED" if g.id in a.schedule.oversized_groups else ""
+        print(f"  {g.id}: {len(g.tests)} tests, {g.est_duration:.3f}s, {'+'.join(g.reasons)}{flag}")
+        for nodeid in g.order:
+            print(f"      {_short(nodeid)}")
+
+    print(f"\nisolated tail ({len(graph.tail)}):")
+    for nodeid in graph.tail:
+        mark = " (order cycle)" if nodeid in graph.cyclic else ""
+        print(f"  {_short(nodeid)}{mark}")
+
+    print("\npolluters:")
+    confirmed = sorted({e.after for e in graph.order_edges if e.reason == "victim-before-polluter"})
+    print(
+        f"  confirmed by detector: {len(confirmed)}"
+        if flaky
+        else "  confirmed by detector: - (run pytest --smartpar-detect)"
+    )
+    for nodeid in confirmed:
+        print(f"    {_short(nodeid)}")
+    changes = deps.state_changes if deps else {}
+    strong = {t: k for t, k in changes.items() if any(not x.startswith(CACHE_GROWTH) for x in k)}
+    cache_only = len(changes) - len(strong)
+    print(
+        f"  candidates (unrestored state changes): {len(strong)}, only cache growth: {cache_only}"
+    )
+    for nodeid, keys in sorted(strong.items()):
+        shown = [k for k in keys if not k.startswith(CACHE_GROWTH)]
+        print(f"    {_short(nodeid)}: {', '.join(shown)}")
+
+    print(
+        f"\npredicted T(m), s (worker start-up "
+        f"{hist.overhead.get('worker_startup_s', 0.0):.3f}s per worker):"
+    )
+    for m, t in a.curve.items():
+        mark = "  <- recommended" if m == a.recommended_workers else ""
+        print(f"  m={m}: {t:.3f}{mark}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "merge":
         return cmd_merge(args)
+    if args.command == "show":
+        return cmd_show(args)
     _help, phase = _UNIMPLEMENTED[args.command]
     print(
         f"smartpar {args.command}: not implemented yet (planned in phase {phase}).",
