@@ -49,8 +49,9 @@ def recorder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FileAccessRecor
     return rec
 
 
-def rw(rec: FileAccessRecorder) -> tuple[set[str], set[str]]:
-    return rec.access.get("t::x", (set(), set()))
+def rw(rec: FileAccessRecorder) -> tuple[set[str], set[str], set[str]]:
+    """(reads, writes, subtree writes) of the current test."""
+    return rec.access.get("t::x", (set(), set(), set()))
 
 
 def test_recorder_events_with_real_signatures(recorder: FileAccessRecorder, tmp_path: Path) -> None:
@@ -58,18 +59,38 @@ def test_recorder_events_with_real_signatures(recorder: FileAccessRecorder, tmp_
     recorder.handle("open", (f"{p}/r.txt", "r", os.O_RDONLY))
     recorder.handle("open", (f"{p}/w.txt", None, os.O_WRONLY | os.O_CREAT))
     recorder.handle("os.remove", (f"{p}/rm.txt", -1))
-    recorder.handle("os.rename", (f"{p}/src", f"{p}/dst", -1, -1))
-    recorder.handle("os.mkdir", (f"{p}/dir", 0o777, -1))
+    recorder.handle("os.rename", (f"{p}/src", f"{p}/dst", -1, -1))  # src is not a dir
+    recorder.handle("os.mkdir", (f"{p}/newdir", 0o777, -1))  # does not exist yet
     recorder.handle("os.rmdir", (f"{p}/rmdir", -1))
     recorder.handle("shutil.rmtree", (f"{p}/tree", None))
     recorder.handle("shutil.copyfile", (f"{p}/cp_src", f"{p}/cp_dst"))
     recorder.handle("shutil.move", (f"{p}/mv_src", f"{p}/mv_dst"))
-    reads, writes = rw(recorder)
+    reads, writes, trees = rw(recorder)
     assert reads == {f"{p}/r.txt", f"{p}/cp_src"}
     assert writes == {
         f"{p}/{name}"
-        for name in ("w.txt", "rm.txt", "src", "dst", "dir", "rmdir", "tree", "cp_dst")
-    } | {f"{p}/mv_src", f"{p}/mv_dst"}
+        for name in ("w.txt", "rm.txt", "src", "dst", "newdir", "cp_dst", "mv_src", "mv_dst")
+    }
+    assert trees == {f"{p}/rmdir", f"{p}/tree"}
+
+
+def test_mkdir_of_existing_directory_is_not_a_write(
+    recorder: FileAccessRecorder, tmp_path: Path
+) -> None:
+    (tmp_path / "exists").mkdir()
+    recorder.handle("os.mkdir", (str(tmp_path / "exists"), 0o777, -1))
+    assert rw(recorder) == (set(), set(), set())
+    assert recorder.stats.existing_dir_mkdir == 1
+
+
+@pytest.mark.parametrize("event", ["os.rename", "os.replace", "shutil.move"])
+def test_moving_a_directory_writes_both_subtrees(
+    recorder: FileAccessRecorder, tmp_path: Path, event: str
+) -> None:
+    (tmp_path / "srcdir").mkdir()
+    args = (str(tmp_path / "srcdir"), str(tmp_path / "dstdir"))
+    recorder.handle(event, (*args, -1, -1) if event != "shutil.move" else args)
+    assert rw(recorder) == (set(), set(), {str(tmp_path / "srcdir"), str(tmp_path / "dstdir")})
 
 
 def test_recorder_relative_bytes_and_descriptors(
@@ -79,7 +100,7 @@ def test_recorder_relative_bytes_and_descriptors(
     recorder.handle("os.remove", (b"b.txt", -1))  # bytes path, dir_fd=-1 means "none"
     recorder.handle("os.remove", ("c.txt", 7))  # relative to an unknown dir_fd
     recorder.handle("open", (5, "r", 0))  # already open descriptor
-    _reads, writes = rw(recorder)
+    _reads, writes, _trees = rw(recorder)
     assert writes == {str(tmp_path / "rel" / "a.txt"), str(tmp_path / "b.txt")}
     assert recorder.stats.unresolved_dir_fd == 1
     assert recorder.stats.fd_events == 1
@@ -100,7 +121,7 @@ def test_recorder_relative_bytes_and_descriptors(
 def test_recorder_ignores(recorder: FileAccessRecorder, tmp_path: Path, path: str) -> None:
     recorder.set_ignore_dirs([tmp_path / "ignored", "/dev", "/proc"])
     recorder.handle("open", (path.format(ignored=tmp_path / "ignored"), "w", 0))
-    assert rw(recorder) == (set(), set())
+    assert rw(recorder) == (set(), set(), set())
     assert recorder.stats.ignored == 1
 
 
@@ -459,10 +480,11 @@ def test_profile_serial(profiled_project: pytest.Pytester, monkeypatch: pytest.M
     deps = load(profiled_project, "dependencies.json")
     access = deps["file_access"]
     assert access[NODE + "test_write"]["W"] == ["<project>/build", "<project>/build/cfg.ini"]
-    assert access[NODE + "test_read"] == {"R": ["<project>/build/cfg.ini"], "W": []}
+    assert access[NODE + "test_read"] == {"R": ["<project>/build/cfg.ini"], "W": [], "W_tree": []}
     assert access[NODE + "test_copy_and_remove"] == {
         "R": ["<project>/README.txt"],
         "W": ["<project>/build_copy.txt"],
+        "W_tree": [],
     }
     assert NODE + "test_tmp_path_ignored" not in access
 
@@ -689,3 +711,64 @@ def test_default_ignore_state(pytester: pytest.Pytester) -> None:
     pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
     deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
     assert deps["state_changes"] == {}
+
+
+DIRECTORY_TESTS = """
+import os, shutil
+
+def test_a_create_new_dir():
+    os.makedirs("out/new", exist_ok=True)  # out and out/new are new: plain writes
+
+def test_b_makedirs_existing():
+    os.makedirs("out/new", exist_ok=True)  # already exists: not a write
+
+def test_c_write_inside():
+    with open("out/new/data.txt", "w") as fh:
+        fh.write("x")
+
+def test_d_read_inside():
+    open("out/new/data.txt").read()
+
+def test_e_rmtree():
+    shutil.rmtree("out")
+
+def test_f_rename_dir():
+    os.makedirs("moved_src/inner")
+    os.rename("moved_src", "moved_dst")
+"""
+
+
+def test_profile_directory_operations(pytester: pytest.Pytester) -> None:
+    pytester.makepyfile(test_dirs=DIRECTORY_TESTS)
+    result = pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
+    result.assert_outcomes(passed=6)
+    deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
+    access = {k.split("::")[1]: v for k, v in deps["file_access"].items()}
+    assert access["test_a_create_new_dir"] == {
+        "R": [],
+        "W": ["<project>/out", "<project>/out/new"],
+        "W_tree": [],
+    }
+    assert "test_b_makedirs_existing" not in access
+    assert access["test_e_rmtree"]["W_tree"] == ["<project>/out"]
+    assert access["test_f_rename_dir"]["W_tree"] == ["<project>/moved_dst", "<project>/moved_src"]
+    assert deps["profile_stats"]["existing_dir_mkdir"] == 1  # one mkdir of the existing leaf
+
+    pairs = {(c["a"].split("::")[1], c["b"].split("::")[1]) for c in deps["conflicts"]}
+    # rmtree of out/ conflicts with everything below it; creating out/new
+    # does not conflict with reading or writing a file inside it.
+    assert {
+        ("test_a_create_new_dir", "test_e_rmtree"),
+        ("test_c_write_inside", "test_e_rmtree"),
+        ("test_d_read_inside", "test_e_rmtree"),
+        ("test_c_write_inside", "test_d_read_inside"),
+    } == pairs
+    # Collection order is saved and drives the order inside the group.
+    (group,) = deps["groups"]
+    assert [t.split("::")[1] for t in group["order"]] == [
+        "test_a_create_new_dir",
+        "test_c_write_inside",
+        "test_d_read_inside",
+        "test_e_rmtree",
+    ]
+    assert deps["collection_index"]["test_dirs.py::test_f_rename_dir"] == 5

@@ -135,10 +135,9 @@ def cmd_show(args: argparse.Namespace) -> int:
         shown = [k for k in keys if not k.startswith(CACHE_GROWTH)]
         print(f"    {_short(nodeid)}: {', '.join(shown)}")
 
-    print(
-        f"\npredicted T(m), s (worker start-up "
-        f"{hist.overhead.get('worker_startup_s', 0.0):.3f}s per worker):"
-    )
+    model = hist.overhead
+    fit = f"fitted on m={model.fit_points}" if model.fit_points else "no measurements yet"
+    print(f"\npredicted T(m), s (overhead {model.a:.3f} + {model.b:.3f}*m, {fit}):")
     for m, t in a.curve.items():
         mark = "  <- recommended" if m == a.recommended_workers else ""
         print(f"  m={m}: {t:.3f}{mark}")

@@ -92,11 +92,82 @@ class TestHistory:
         )
 
 
+# Numbers of workers whose measured overhead calibrates the model.
+CALIBRATION_WORKERS = (1, 2, 4)
+
+
+def _number(value: Any, what: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SchemaError(f"{what}: expected a number")
+    return float(value)
+
+
+@dataclass
+class Overhead:
+    """Parallel overhead model ``overhead(m) = a + b*m`` (a hypothesis to test).
+
+    ``samples_s`` holds the EMA of the measured overhead per number of
+    workers; ``a`` and ``b`` are refitted by least squares over the samples at
+    m in CALIBRATION_WORKERS after every merge. With one calibration point the
+    model is the constant ``a``; without any, zero.
+    """
+
+    samples_s: dict[int, float] = field(default_factory=dict)
+    a: float = 0.0
+    b: float = 0.0
+    fit_points: list[int] = field(default_factory=list)
+
+    def predict(self, workers: int) -> float:
+        return max(0.0, self.a + self.b * workers)
+
+    def refit(self) -> None:
+        points = sorted((m, y) for m, y in self.samples_s.items() if m in CALIBRATION_WORKERS)
+        self.fit_points = [m for m, _y in points]
+        if not points:
+            self.a = self.b = 0.0
+        elif len(points) == 1:
+            self.a, self.b = points[0][1], 0.0
+        else:
+            n = len(points)
+            mean_m = sum(m for m, _ in points) / n
+            mean_y = sum(y for _, y in points) / n
+            sxx = sum((m - mean_m) ** 2 for m, _ in points)
+            sxy = sum((m - mean_m) * (y - mean_y) for m, y in points)
+            self.b = sxy / sxx
+            self.a = mean_y - self.b * mean_m
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "samples_s": {str(m): y for m, y in sorted(self.samples_s.items())},
+            "a": self.a,
+            "b": self.b,
+            "fit_points": self.fit_points,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any, what: str) -> Overhead:
+        if not isinstance(data, dict):
+            raise SchemaError(f"{what}: expected a JSON object")
+        samples = _get(data, "samples_s", dict, what)
+        try:
+            parsed = {int(m): _number(y, f"{what} sample {m!r}") for m, y in samples.items()}
+        except ValueError as exc:
+            raise SchemaError(f"{what}: sample keys must be worker counts") from exc
+        points = _get(data, "fit_points", list, what)
+        if not all(isinstance(m, int) and not isinstance(m, bool) for m in points):
+            raise SchemaError(f"{what}: fit_points must be integers")
+        return cls(
+            samples_s=parsed,
+            a=_number(_get(data, "a", (int, float), what), what),
+            b=_number(_get(data, "b", (int, float), what), what),
+            fit_points=list(points),
+        )
+
+
 @dataclass
 class History:
     tests: dict[str, TestHistory] = field(default_factory=dict)
-    # Measured overheads, e.g. {"worker_startup_s": 0.41}.
-    overhead: dict[str, float] = field(default_factory=dict)
+    overhead: Overhead = field(default_factory=Overhead)
     # Run ids folded into this history whose files may still be in runs/.
     # Non-empty only if a merge was interrupted between writing history.json
     # and moving the run files; lets the next merge avoid counting them twice.
@@ -106,7 +177,7 @@ class History:
         return {
             **envelope(),
             "tests": {k: asdict(v) for k, v in sorted(self.tests.items())},
-            "overhead": dict(sorted(self.overhead.items())),
+            "overhead": self.overhead.to_dict(),
             "last_merged_runs": sorted(self.last_merged_runs),
         }
 
@@ -115,16 +186,12 @@ class History:
         what = "history.json"
         data = check_version(data, what)
         tests = _get(data, "tests", dict, what)
-        overhead = _get(data, "overhead", dict, what)
-        for key, value in overhead.items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise SchemaError(f"{what}: overhead {key!r} is not a number")
         merged = data.get("last_merged_runs", [])
         if not isinstance(merged, list) or not all(isinstance(r, str) for r in merged):
             raise SchemaError(f"{what}: last_merged_runs must be a list of strings")
         return cls(
             tests={k: TestHistory.from_dict(v, f"{what} test {k!r}") for k, v in tests.items()},
-            overhead={k: float(v) for k, v in overhead.items()},
+            overhead=Overhead.from_dict(_get(data, "overhead", dict, what), f"{what} overhead"),
             last_merged_runs=list(merged),
         )
 
@@ -181,8 +248,9 @@ class RunRecord:
     wall_time_s: float
     tests: list[TestRecord] = field(default_factory=list)
     randomly_reorder_disabled: bool = False
-    # Measured worker start-up time of this run, if known.
-    worker_startup_s: float | None = None
+    # Measured parallel overhead of this run (wall time not explained by
+    # test durations), if known; calibrates the Overhead model.
+    overhead_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -195,11 +263,9 @@ class RunRecord:
         run_id = _get(data, "run_id", str, what)
         what = f"run file {run_id!r}"
         tests = _get(data, "tests", list, what)
-        startup = data.get("worker_startup_s")
-        if startup is not None and (
-            isinstance(startup, bool) or not isinstance(startup, (int, float))
-        ):
-            raise SchemaError(f"{what}: worker_startup_s is not a number")
+        overhead = data.get("overhead_s")
+        if overhead is not None:
+            overhead = _number(overhead, f"{what}: overhead_s")
         started_at = _get(data, "started_at", str, what)
         try:
             datetime.fromisoformat(started_at)
@@ -214,7 +280,7 @@ class RunRecord:
             wall_time_s=float(_get(data, "wall_time_s", (int, float), what)),
             tests=[TestRecord.from_dict(t, f"{what} test #{i}") for i, t in enumerate(tests)],
             randomly_reorder_disabled=_get(data, "randomly_reorder_disabled", bool, what),
-            worker_startup_s=None if startup is None else float(startup),
+            overhead_s=overhead,
         )
 
 
@@ -225,6 +291,9 @@ class RunRecord:
 class FileAccess:
     R: list[str] = field(default_factory=list)
     W: list[str] = field(default_factory=list)
+    # Directories whose whole subtree is written (rmtree, rmdir, rename/move of
+    # a directory): conflicts with any access at or below the path.
+    W_tree: list[str] = field(default_factory=list)
 
 
 def _str_list(value: Any, what: str) -> list[str]:
@@ -320,6 +389,9 @@ class Dependencies:
     conflicts: list[Conflict] = field(default_factory=list)
     order_edges: list[OrderEdge] = field(default_factory=list)
     groups: list[Group] = field(default_factory=list)
+    # Position of each test in pytest's collection order at profiling time;
+    # breaks ties of the order inside a group.
+    collection_index: dict[str, int] = field(default_factory=dict)
     # Diagnostics of the profiling run: skipped/unresolved audit events,
     # modules snapshotted in cheap mode, etc.
     profile_stats: dict[str, Any] = field(default_factory=dict)
@@ -328,8 +400,10 @@ class Dependencies:
         return {
             **envelope(),
             "file_access": {
-                k: {"R": sorted(v.R), "W": sorted(v.W)} for k, v in sorted(self.file_access.items())
+                k: {"R": sorted(v.R), "W": sorted(v.W), "W_tree": sorted(v.W_tree)}
+                for k, v in sorted(self.file_access.items())
             },
+            "collection_index": dict(sorted(self.collection_index.items())),
             "state_changes": {k: sorted(v) for k, v in sorted(self.state_changes.items())},
             "conflicts": [asdict(c) for c in sorted(self.conflicts)],
             "order_edges": [asdict(e) for e in sorted(self.order_edges)],
@@ -348,11 +422,19 @@ class Dependencies:
             file_access[nodeid] = FileAccess(
                 R=_str_list(access.get("R"), f"{what}: file_access {nodeid!r} R"),
                 W=_str_list(access.get("W"), f"{what}: file_access {nodeid!r} W"),
+                W_tree=_str_list(
+                    access.get("W_tree", []), f"{what}: file_access {nodeid!r} W_tree"
+                ),
             )
         state_changes = {
             k: _str_list(v, f"{what}: state_changes {k!r}")
             for k, v in _get(data, "state_changes", dict, what).items()
         }
+        index = data.get("collection_index", {})
+        if not isinstance(index, dict) or not all(
+            isinstance(i, int) and not isinstance(i, bool) for i in index.values()
+        ):
+            raise SchemaError(f"{what}: collection_index must map nodeids to integers")
         # Optional: absent when the file was created by the detector alone.
         stats = _get(data, "profile_stats", dict, what) if "profile_stats" in data else {}
         return cls(
@@ -370,6 +452,7 @@ class Dependencies:
                 Group.from_dict(g, f"{what}: group")
                 for g in _obj_list(_get(data, "groups", list, what), f"{what}: groups")
             ],
+            collection_index=dict(index),
             profile_stats=stats,
         )
 

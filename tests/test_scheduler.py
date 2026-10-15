@@ -13,6 +13,7 @@ from smartpar.models import (
     FileAccess,
     Flaky,
     History,
+    Overhead,
     TestHistory,
 )
 from smartpar.scheduler import SINGLE, Unit
@@ -97,7 +98,9 @@ def test_lpt_rejects_zero_workers() -> None:
 def test_schedule_adds_tail_and_overhead(caplog: pytest.LogCaptureFixture) -> None:
     units = [Unit("g0", ("a", "b"), 6.0), *singles({"c": 1.0, "d": 1.0})]
     with caplog.at_level(logging.WARNING, logger="smartpar.scheduler"):
-        plan = scheduler.schedule(units, 2, tail=["t"], durations={"t": 2.0}, worker_startup_s=0.5)
+        plan = scheduler.schedule(
+            units, 2, tail=["t"], durations={"t": 2.0}, overhead=Overhead(a=0.2, b=0.4)
+        )
     assert plan.lpt_makespan_s == 6.0
     assert plan.tail_s == 2.0
     assert plan.overhead_s == 1.0
@@ -109,7 +112,7 @@ def test_schedule_adds_tail_and_overhead(caplog: pytest.LogCaptureFixture) -> No
 
 def test_curve_and_recommendation_with_startup_cost() -> None:
     units = singles({f"t{i}": 1.0 for i in range(8)})
-    curve = scheduler.predicted_curve(units, tail_s=0.0, worker_startup_s=0.5, max_workers=8)
+    curve = scheduler.predicted_curve(units, 0.0, Overhead(a=0.0, b=0.5), max_workers=8)
     assert curve[1] == 8.5 and curve[2] == 5.0 and curve[4] == 4.0 and curve[8] == 5.0
     assert scheduler.recommend_workers(curve) == 4
 
@@ -123,15 +126,17 @@ def test_available_cpus_positive() -> None:
     assert scheduler.available_cpus() >= 1
 
 
-def test_analyze_isolates_new_and_nod_tests() -> None:
+def test_analyze_isolates_nod_tests_only() -> None:
     hist = History(
         tests={t: th(d) for t, d in {"a": 2.0, "b": 1.0, "c": 1.0, "nod": 0.5}.items()},
-        overhead={"worker_startup_s": 0.1},
+        overhead=Overhead(a=0.1, b=0.05),
     )
     deps = Dependencies(file_access={"a": FileAccess(W=["f"]), "b": FileAccess(R=["f"])})
     flaky = Flaky(nod=[{"test": "nod", "fail_rate": "2/20"}])
     a = scheduler.analyze(["a", "b", "c", "nod", "new"], hist, deps, flaky, max_workers=3)
-    assert a.graph.tail == ["new", "nod"]  # equal estimates; then nodeid
+    assert a.graph.tail == ["nod"]  # NOD only; the new test is planned normally
+    assert a.estimates.new_tests == ["new"]
+    assert a.estimates.durations["new"] == a.estimates.median_s
     assert [g.tests for g in a.graph.groups] == [["a", "b"]]
     assert a.recommended_workers in a.curve
     assert set(a.curve) == {1, 2, 3}

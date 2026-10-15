@@ -6,12 +6,18 @@ goes to the currently least loaded worker. The rule is deterministic: equal
 durations are ordered by the unit's first nodeid, equally loaded workers by
 worker number.
 
-The isolated tail runs after all workers have finished, sequentially, so
+The isolated tail (NOD tests and unresolved order cycles) runs after all
+workers have finished, sequentially, so
 
-    T(m) = LPT_makespan(m) + tail + overhead(m),   overhead(m) = worker_startup_s * m
+    T(m) = LPT_makespan(m) + tail + overhead(m),   overhead(m) = a + b*m
 
-(linear start-up model: one measured start-up cost per worker). The
-recommended m is the smallest m with T(m) <= 1.05 * min_k T(k).
+where a, b are fitted by least squares to overheads measured at m = 1, 2, 4
+(``models.Overhead``; the linear form is a hypothesis checked by the
+experiment). The recommended m is the smallest m with
+T(m) <= 1.05 * min_k T(k).
+
+New tests (not in history) are planned like any other test with the median
+duration; a failing new test is re-run at the end (phase 5).
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ from dataclasses import dataclass, field
 
 from smartpar.graph import GraphResult
 from smartpar.graph import build as build_graph
-from smartpar.models import Dependencies, Flaky, History
+from smartpar.models import Dependencies, Flaky, History, Overhead
 
 log = logging.getLogger("smartpar.scheduler")
 
@@ -52,8 +58,8 @@ def worker_name(index: int) -> str:
 @dataclass
 class Estimates:
     durations: dict[str, float]
-    new_tests: list[str]  # never seen in history: unknown file access, isolate
-    estimated: list[str]  # seen but never timed: duration = median of known
+    new_tests: list[str]  # never seen in history: median; re-run at the end if failed
+    estimated: list[str]  # seen but never timed: median
     median_s: float
     has_timings: bool
 
@@ -135,20 +141,16 @@ class Schedule:
     oversized_groups: list[str] = field(default_factory=list)
 
 
-def overhead(workers: int, worker_startup_s: float) -> float:
-    return worker_startup_s * workers
-
-
 def schedule(
     units: list[Unit],
     workers: int,
     tail: list[str],
     durations: Mapping[str, float],
-    worker_startup_s: float = 0.0,
+    overhead: Overhead | None = None,
 ) -> Schedule:
     result = lpt(units, workers)
     tail_s = sum(durations.get(t, 0.0) for t in tail)
-    over = overhead(workers, worker_startup_s)
+    over = overhead.predict(workers) if overhead else 0.0
     makespan = result.makespan + tail_s + over
     # A group longer than half the makespan dominates it; it stays whole
     # (correctness first) but is reported.
@@ -175,11 +177,12 @@ def schedule(
 
 
 def predicted_curve(
-    units: list[Unit], tail_s: float, worker_startup_s: float, max_workers: int
+    units: list[Unit], tail_s: float, overhead: Overhead | None, max_workers: int
 ) -> dict[int, float]:
     """T(m) for m = 1..max_workers."""
+    model = overhead or Overhead()
     return {
-        m: lpt(units, m).makespan + tail_s + overhead(m, worker_startup_s)
+        m: lpt(units, m).makespan + tail_s + model.predict(m)
         for m in range(1, max(1, max_workers) + 1)
     }
 
@@ -210,25 +213,32 @@ def analyze(
     flaky: Flaky | None,
     max_workers: int,
     workers: int | None = None,
+    collection_index: Mapping[str, int] | None = None,
 ) -> Analysis:
     """Plan ``tests`` for ``workers`` (default: the recommended number).
 
-    New tests (never seen in history) and NOD tests go to the isolated tail.
+    NOD tests (and order cycles, found by the graph) go to the isolated tail;
+    new tests are planned normally with the median duration. The order inside
+    groups follows ``collection_index`` (default: the one saved by profiling).
     """
     tests = sorted(set(tests))
     est = estimate_durations(tests, history)
-    isolate = set(est.new_tests) | set(flaky.nod_tests() if flaky else ())
+    isolate = set(flaky.nod_tests() if flaky else ())
     graph = build_graph(
         tests,
         deps.file_access if deps else {},
         flaky.order_edges() if flaky else [],
         est.durations,
         isolate=isolate,
+        collection_index=(
+            collection_index
+            if collection_index is not None
+            else (deps.collection_index if deps else None)
+        ),
     )
     units = units_from_graph(graph, est.durations)
     tail_s = sum(est.durations[t] for t in graph.tail)
-    startup = history.overhead.get("worker_startup_s", 0.0)
-    curve = predicted_curve(units, tail_s, startup, max_workers)
+    curve = predicted_curve(units, tail_s, history.overhead, max_workers)
     recommended = recommend_workers(curve)
-    plan = schedule(units, workers or recommended, graph.tail, est.durations, startup)
+    plan = schedule(units, workers or recommended, graph.tail, est.durations, history.overhead)
     return Analysis(est, graph, units, curve, recommended, plan)

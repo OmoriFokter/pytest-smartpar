@@ -180,13 +180,13 @@ def apply_run(history: History, run: RunRecord, alpha: float) -> None:
         entry.runs += 1
         entry.last_outcome = rec.outcome
         entry.fail_count += int(rec.outcome in FAILED_OUTCOMES)
-    if timed and run.worker_startup_s is not None:
-        prev = history.overhead.get("worker_startup_s")
-        history.overhead["worker_startup_s"] = (
-            run.worker_startup_s
-            if prev is None
-            else alpha * run.worker_startup_s + (1 - alpha) * prev
+    if timed and run.overhead_s is not None:
+        samples = history.overhead.samples_s
+        prev = samples.get(run.workers)
+        samples[run.workers] = (
+            run.overhead_s if prev is None else alpha * run.overhead_s + (1 - alpha) * prev
         )
+        history.overhead.refit()
 
 
 @dataclass

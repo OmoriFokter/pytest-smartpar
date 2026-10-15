@@ -105,6 +105,7 @@ _EVENTS = frozenset(
     }
 )
 _NO_DIR_FD = (None, -1)
+READ, WRITE, WRITE_TREE = 0, 1, 2
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
 _WRITE_MODE_CHARS = frozenset("wax+")
 
@@ -121,6 +122,7 @@ class AuditStats:
     fd_events: int = 0  # operations on an already open descriptor
     unresolved_dir_fd: int = 0  # relative path + dir_fd, cannot be resolved
     ignored: int = 0  # filtered out (stdlib, site-packages, tmp, /dev ...)
+    existing_dir_mkdir: int = 0  # mkdir/makedirs of an existing directory: not a write
 
 
 class FileAccessRecorder:
@@ -128,7 +130,8 @@ class FileAccessRecorder:
 
     def __init__(self, ignore_dirs: Iterable[str | Path] = ()) -> None:
         self.current: str | None = None
-        self.access: dict[str, tuple[set[str], set[str]]] = {}
+        # nodeid -> (reads, writes, subtree writes)
+        self.access: dict[str, tuple[set[str], set[str], set[str]]] = {}
         self.stats = AuditStats()
         self.set_ignore_dirs(ignore_dirs)
 
@@ -149,39 +152,55 @@ class FileAccessRecorder:
         )
 
     def handle(self, event: str, args: tuple[Any, ...]) -> None:
+        """Audit events arrive *before* the operation, so ``isdir`` sees the old state."""
         if event == "open":
-            self._record(args[0], is_write_open(args[1], args[2]), None)
-        elif event in ("os.remove", "os.unlink", "os.rmdir", "shutil.rmtree"):
-            self._record(args[0], True, args[1])
-        elif event in ("os.rename", "os.replace"):
-            self._record(args[0], True, args[2])
-            self._record(args[1], True, args[3])
+            self._add(
+                self._resolve(args[0], None), WRITE if is_write_open(args[1], args[2]) else READ
+            )
+        elif event in ("os.remove", "os.unlink"):
+            self._add(self._resolve(args[0], args[1]), WRITE)
+        elif event in ("os.rmdir", "shutil.rmtree"):
+            self._add(self._resolve(args[0], args[1]), WRITE_TREE)
+        elif event in ("os.rename", "os.replace", "shutil.move"):
+            src_fd, dst_fd = (args[2], args[3]) if len(args) > 2 else (None, None)
+            src, dst = self._resolve(args[0], src_fd), self._resolve(args[1], dst_fd)
+            # Moving a directory rewrites both subtrees.
+            kind = WRITE_TREE if src is not None and os.path.isdir(src) else WRITE
+            self._add(src, kind)
+            self._add(dst, kind)
         elif event == "os.mkdir":
-            self._record(args[0], True, args[2])
+            path = self._resolve(args[0], args[2])
+            if path is not None and os.path.isdir(path):
+                self.stats.existing_dir_mkdir += 1  # makedirs(exist_ok=True) etc.
+            else:
+                self._add(path, WRITE)  # a new directory: only this path
         elif event == "shutil.copyfile":
-            self._record(args[0], False, None)
-            self._record(args[1], True, None)
-        elif event == "shutil.move":
-            self._record(args[0], True, None)
-            self._record(args[1], True, None)
+            self._add(self._resolve(args[0], None), READ)
+            self._add(self._resolve(args[1], None), WRITE)
 
-    def _record(self, raw: Any, write: bool, dir_fd: Any) -> None:
+    def _resolve(self, raw: Any, dir_fd: Any) -> str | None:
+        """Absolute normalized path, or None if it cannot or need not be recorded."""
         if isinstance(raw, int):
             self.stats.fd_events += 1
-            return
+            return None
         path = os.fsdecode(raw)
         if not os.path.isabs(path):
             if dir_fd not in _NO_DIR_FD:
                 self.stats.unresolved_dir_fd += 1
-                return
+                return None
             path = os.path.join(os.getcwd(), path)
         path = os.path.normpath(path)
         if self.is_ignored(path):
             self.stats.ignored += 1
+            return None
+        return path
+
+    def _add(self, path: str | None, kind: int) -> None:
+        if path is None:
             return
         assert self.current is not None
-        reads, writes = self.access.setdefault(self.current, (set(), set()))
-        (writes if write else reads).add(path)
+        sets = self.access.setdefault(self.current, (set(), set(), set()))
+        sets[kind].add(path)
 
 
 # The audit hook cannot be removed, so it is installed at most once per
@@ -426,6 +445,7 @@ class ProfileData:
     state_changes: dict[str, list[str]] = field(default_factory=dict)
     stats: dict[str, int] = field(default_factory=dict)
     cheap_modules: list[str] = field(default_factory=list)
+    collection_index: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self, worker: str) -> dict[str, Any]:
         return {
@@ -435,6 +455,7 @@ class ProfileData:
             "state_changes": self.state_changes,
             "stats": self.stats,
             "cheap_modules": sorted(self.cheap_modules),
+            "collection_index": self.collection_index,
         }
 
     @classmethod
@@ -445,6 +466,7 @@ class ProfileData:
             state_changes=data["state_changes"],
             stats=data["stats"],
             cheap_modules=data["cheap_modules"],
+            collection_index=data["collection_index"],
         )
 
     def update(self, other: ProfileData) -> None:
@@ -453,6 +475,8 @@ class ProfileData:
         for key, value in other.stats.items():
             self.stats[key] = self.stats.get(key, 0) + value
         self.cheap_modules = sorted(set(self.cheap_modules) | set(other.cheap_modules))
+        # Every xdist worker collects the same items in the same order.
+        self.collection_index.update(other.collection_index)
 
 
 def build_dependencies(
@@ -472,6 +496,7 @@ def build_dependencies(
         nodeid: FileAccess(
             R=sorted({to_resource(p, root) for p in rw["R"]}),
             W=sorted({to_resource(p, root) for p in rw["W"]}),
+            W_tree=sorted({to_resource(p, root) for p in rw["W_tree"]}),
         )
         for nodeid, rw in profile.file_access.items()
     }
@@ -479,7 +504,12 @@ def build_dependencies(
     durations = estimate_durations(tests, history).durations
     edges = flaky.order_edges() if flaky else []
     graph = build_graph(
-        tests, file_access, edges, durations, isolate=flaky.nod_tests() if flaky else ()
+        tests,
+        file_access,
+        edges,
+        durations,
+        isolate=flaky.nod_tests() if flaky else (),
+        collection_index=profile.collection_index,
     )
     return Dependencies(
         file_access=file_access,
@@ -487,6 +517,7 @@ def build_dependencies(
         conflicts=graph.conflicts,
         order_edges=graph.order_edges,
         groups=graph.groups,
+        collection_index=profile.collection_index,
         profile_stats={
             **extra_stats,
             **profile.stats,
@@ -530,6 +561,7 @@ class ProfilerPlugin:
         self.recorder = FileAccessRecorder()
         self.snapshotter = StateSnapshotter(self.root, ignore_dirs=self._venv_dirs())
         self.state_changes: dict[str, list[str]] = {}
+        self.collection_index: dict[str, int] = {}
         self.ignore_state: list[str] = list(config.getini("smartpar_ignore_state"))
 
     @staticmethod
@@ -555,6 +587,7 @@ class ProfilerPlugin:
             activate(self.recorder)
 
     def pytest_collection_finish(self, session: pytest.Session) -> None:
+        self.collection_index = {item.nodeid: i for i, item in enumerate(session.items)}
         self.snapshotter.set_test_dirs(item.path.parent for item in session.items)
 
     @pytest.hookimpl(wrapper=True)
@@ -574,12 +607,13 @@ class ProfilerPlugin:
     def _own_profile(self) -> ProfileData:
         return ProfileData(
             file_access={
-                nodeid: {"R": sorted(r), "W": sorted(w)}
-                for nodeid, (r, w) in self.recorder.access.items()
+                nodeid: {"R": sorted(r), "W": sorted(w), "W_tree": sorted(t)}
+                for nodeid, (r, w, t) in self.recorder.access.items()
             },
             state_changes=self.state_changes,
             stats=vars(self.recorder.stats).copy(),
             cheap_modules=sorted(self.snapshotter.cheap),
+            collection_index=self.collection_index,
         )
 
     def _partial_path(self, worker: str) -> Path:

@@ -32,7 +32,7 @@ def make_run(
         finished_at=(started + timedelta(seconds=1)).isoformat(),
         wall_time_s=1.0,
         tests=[TestRecord(n, outcome, d, "gw0", 0.0, d) for n, d in durations.items()],
-        worker_startup_s=startup,
+        overhead_s=startup,
     )
 
 
@@ -116,7 +116,9 @@ def test_apply_run_ema_and_counters() -> None:
     assert h.tests["a"].duration_ema == 1.0  # first passed run initializes
     history.apply_run(h, make_run("r2", T0, {"a": 2.0}, startup=1.0), alpha=0.3)
     assert h.tests["a"].duration_ema == pytest.approx(0.3 * 2.0 + 0.7 * 1.0)
-    assert h.overhead["worker_startup_s"] == pytest.approx(0.3 * 1.0 + 0.7 * 0.5)
+    # Both runs have workers=1: one calibration point, EMA of the samples.
+    assert h.overhead.samples_s == {1: pytest.approx(0.3 * 1.0 + 0.7 * 0.5)}
+    assert (h.overhead.a, h.overhead.b) == (pytest.approx(0.65), 0.0)
     entry = h.tests["a"]
     assert (entry.runs, entry.timed_runs, entry.fail_count, entry.last_outcome) == (
         2,
@@ -148,7 +150,7 @@ def test_profile_runs_update_counters_only() -> None:
     history.apply_run(h, profile_run, alpha=0.3)
     assert (h.tests["a"].duration_ema, h.tests["a"].timed_runs, h.tests["a"].runs) == (1.0, 1, 2)
     assert (h.tests["b"].duration_ema, h.tests["b"].timed_runs, h.tests["b"].runs) == (0.0, 0, 1)
-    assert "worker_startup_s" not in h.overhead
+    assert h.overhead.samples_s == {}
 
 
 # --- merge --------------------------------------------------------------------------

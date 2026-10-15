@@ -4,6 +4,7 @@ Edges come from two sources only:
 
 * file conflicts, i.e. violations of Bernstein's conditions (Bernstein, 1966)
   ``W(A)∩R(B)=∅``, ``R(A)∩W(B)=∅``, ``W(A)∩W(B)=∅`` - "not concurrently";
+  a subtree write of a directory intersects every path below it;
 * confirmed order dependencies from flaky.json - "``before`` runs before
   ``after``" (victim before polluter, state setter before brittle test).
 
@@ -11,14 +12,15 @@ State changes found by profiling are candidates for the detector and create
 no edges by themselves.
 
 Connected tests form a group (union-find) that runs on one worker; inside a
-group tests are sorted topologically by the order edges, ties broken by
-descending duration, then nodeid. Tests on a cycle of order edges, tests to
-isolate (new, NOD) and everything that must run after them go to the isolated
-tail, executed last and sequentially.
+group tests are sorted topologically by the order edges, ties broken by the
+collection order (durations inside one worker do not change the makespan).
+Tests on a cycle of order edges, tests to isolate (NOD) and everything that
+must run after them go to the isolated tail, executed last and sequentially.
 """
 
 from __future__ import annotations
 
+import bisect
 import heapq
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
@@ -37,11 +39,15 @@ def find_conflicts(file_access: Mapping[str, FileAccess], tests: Iterable[str]) 
     """Pairs of tests violating Bernstein's conditions, one entry per (a, b, resource).
 
     Uses an inverted index resource -> readers/writers, so only tests sharing a
-    resource are compared (not all n^2 pairs). Tests outside ``tests`` are ignored.
+    resource are compared (not all n^2 pairs). A subtree write (``W_tree``) of
+    directory D conflicts with every access to D or a path below it, found by
+    a range search over the sorted resources. Tests outside ``tests`` are
+    ignored.
     """
     universe = set(tests)
     readers: dict[str, set[str]] = defaultdict(set)
-    writers: dict[str, set[str]] = defaultdict(set)
+    writers: dict[str, set[str]] = defaultdict(set)  # plain and subtree writes
+    tree_writers: dict[str, set[str]] = defaultdict(set)
     for nodeid, access in file_access.items():
         if nodeid not in universe:
             continue
@@ -49,17 +55,36 @@ def find_conflicts(file_access: Mapping[str, FileAccess], tests: Iterable[str]) 
             readers[resource].add(nodeid)
         for resource in access.W:
             writers[resource].add(nodeid)
+        for resource in access.W_tree:
+            writers[resource].add(nodeid)
+            tree_writers[resource].add(nodeid)
 
     conflicts: set[Conflict] = set()
+
+    def add(writer: str, other: str, resource: str, other_writes: bool) -> None:
+        if writer == other:
+            return
+        a, b = sorted((writer, other))
+        a_writes = a == writer or other_writes
+        b_writes = b == writer or other_writes
+        conflicts.add(Conflict(a, b, resource, _kind(a_writes, b_writes)))
+
     for resource, ws in writers.items():
-        accessors = ws | readers.get(resource, set())
         for w in ws:
-            for other in accessors:
-                if other == w:
-                    continue
-                a, b = sorted((w, other))
-                kind = _kind(a in ws, b in ws)
-                conflicts.add(Conflict(a, b, resource, kind))
+            for other in ws | readers.get(resource, set()):
+                add(w, other, resource, other in ws)
+
+    paths = sorted(readers.keys() | writers.keys())
+    for directory, tws in tree_writers.items():
+        # Every path below ``directory`` starts with "directory/" and sorts
+        # before "directory0" ('0' follows '/').
+        lo = bisect.bisect_left(paths, directory + "/")
+        hi = bisect.bisect_left(paths, directory + "0")
+        for path in paths[lo:hi]:
+            ws = writers.get(path, set())
+            for w in tws:
+                for other in ws | readers.get(path, set()):
+                    add(w, other, path, other in ws)
     return sorted(conflicts)
 
 
@@ -162,12 +187,13 @@ def _descendants(seeds: Iterable[str], succ: Mapping[str, set[str]]) -> set[str]
 
 
 def topo_order(
-    nodes: Iterable[str], edges: Iterable[OrderEdge], durations: Mapping[str, float]
+    nodes: Iterable[str], edges: Iterable[OrderEdge], rank: Mapping[str, int]
 ) -> list[str]:
-    """Kahn's algorithm; among ready tests the longest first, then by nodeid.
+    """Kahn's algorithm; ready tests in collection order (``rank``), then nodeid.
 
-    If a cycle remains, the smallest remaining nodeid is taken to keep going
-    (only used for the isolated tail; groups never contain cycles).
+    Durations do not matter here: inside one worker they do not change the
+    makespan. If a cycle remains, the smallest remaining nodeid is taken to
+    keep going (only happens in the isolated tail; groups have no cycles).
     """
     members = set(nodes)
     succ: dict[str, set[str]] = defaultdict(set)
@@ -177,8 +203,10 @@ def topo_order(
             succ[e.before].add(e.after)
             indeg[e.after] += 1
 
-    def key(n: str) -> tuple[float, str]:
-        return (-durations.get(n, 0.0), n)
+    unranked = len(rank)
+
+    def key(n: str) -> tuple[int, str]:
+        return (rank.get(n, unranked), n)
 
     ready = [key(n) for n in members if indeg[n] == 0]
     heapq.heapify(ready)
@@ -189,7 +217,7 @@ def topo_order(
             n = min(m for m in members if m not in done)
             indeg[n] = 0
             ready.append(key(n))
-        _neg, n = heapq.heappop(ready)
+        _rank, n = heapq.heappop(ready)
         if n in done:
             continue
         done.add(n)
@@ -222,8 +250,14 @@ def build(
     order_edges: Iterable[OrderEdge],
     durations: Mapping[str, float],
     isolate: Iterable[str] = (),
+    collection_index: Mapping[str, int] | None = None,
 ) -> GraphResult:
-    """Group ``tests``; edges referring to tests outside ``tests`` are dropped."""
+    """Group ``tests``; edges referring to tests outside ``tests`` are dropped.
+
+    ``collection_index`` (pytest's collection order) breaks ties of the order
+    inside groups and the tail; tests without an index come last, by nodeid.
+    """
+    rank = collection_index or {}
     universe = sorted(set(tests))
     members = set(universe)
     conflicts = find_conflicts(file_access, universe)
@@ -242,7 +276,7 @@ def build(
     # Whatever must run after a tail test goes to the tail as well, otherwise
     # it would run before it.
     tail_set = _descendants(cyclic | (set(isolate) & members), succ)
-    tail = topo_order(tail_set, edges, durations)
+    tail = topo_order(tail_set, edges, rank)
 
     uf = UnionFind(t for t in universe if t not in tail_set)
     for c in conflicts:
@@ -268,7 +302,7 @@ def build(
             Group(
                 id=f"g{len(groups)}",
                 tests=component,
-                order=topo_order(component, edges, durations),
+                order=topo_order(component, edges, rank),
                 est_duration=sum(durations.get(t, 0.0) for t in component),
                 reasons=reasons,
             )

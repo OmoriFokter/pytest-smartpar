@@ -77,14 +77,55 @@ def test_union_find_groups_transitively_with_reasons() -> None:
     assert result.tail == []
 
 
-def test_order_inside_group_topological_then_duration_then_nodeid() -> None:
+def test_order_inside_group_topological_then_collection_order() -> None:
     access = {t: fa(w=["shared"]) for t in "abcde"}
     edges = [OrderEdge("e", "a", V_P)]  # e must precede a
     durations = {"a": 5.0, "b": 1.0, "c": 3.0, "d": 3.0, "e": 0.1}
-    (group,) = graph.build("abcde", access, edges, durations).groups
-    # Ready first: c, d (3.0, by nodeid), b (1.0), e (0.1); a only after e.
-    assert group.order == ["c", "d", "b", "e", "a"]
+    collected = {"d": 0, "a": 1, "c": 2, "e": 3, "b": 4}
+    (group,) = graph.build("abcde", access, edges, durations, collection_index=collected).groups
+    # Collection order d, a, c, e, b - but a waits for e. Durations play no role.
+    assert group.order == ["d", "c", "e", "a", "b"]
     assert group.est_duration == pytest.approx(12.1)
+
+
+def test_tests_without_collection_index_come_last_by_nodeid() -> None:
+    access = {t: fa(w=["shared"]) for t in "abc"}
+    (group,) = graph.build("abc", access, [], {}, collection_index={"c": 0}).groups
+    assert group.order == ["c", "a", "b"]
+
+
+# --- subtree writes -----------------------------------------------------------------
+
+
+def test_subtree_write_conflicts_with_everything_below() -> None:
+    access = {
+        "clean": FileAccess(W_tree=["<project>/build"]),
+        "reader": fa(r=["<project>/build/cfg.ini"]),
+        "writer": fa(w=["<project>/build/sub/out.bin"]),
+        "dir_itself": fa(r=["<project>/build"]),
+        "sibling": fa(r=["<project>/build2/x", "<project>/buildx"]),  # not below build/
+    }
+    assert graph.find_conflicts(access, access) == [
+        Conflict("clean", "dir_itself", "<project>/build", "W-R"),
+        Conflict("clean", "reader", "<project>/build/cfg.ini", "W-R"),
+        Conflict("clean", "writer", "<project>/build/sub/out.bin", "W-W"),
+    ]
+
+
+def test_nested_subtree_writes_conflict() -> None:
+    access = {
+        "outer": FileAccess(W_tree=["<project>/a"]),
+        "inner": FileAccess(W_tree=["<project>/a/b"]),
+    }
+    assert graph.find_conflicts(access, access) == [
+        Conflict("inner", "outer", "<project>/a/b", "W-W")
+    ]
+
+
+def test_plain_directory_write_is_not_a_subtree_write() -> None:
+    # Creating a new directory writes only that path.
+    access = {"mk": fa(w=["<project>/out"]), "reader": fa(r=["<project>/out/f"])}
+    assert graph.find_conflicts(access, access) == []
 
 
 def test_cycle_and_its_dependents_go_to_tail() -> None:

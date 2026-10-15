@@ -11,6 +11,7 @@ from smartpar import __version__
 from smartpar.models import (
     SCHEMA_VERSION,
     History,
+    Overhead,
     RunRecord,
     SchemaError,
     TestHistory,
@@ -28,7 +29,7 @@ def make_run(**overrides: object) -> RunRecord:
         "wall_time_s": 5.0,
         "tests": [TestRecord("t.py::a", "passed", 0.5, "gw0", 10.0, 10.5)],
         "randomly_reorder_disabled": True,
-        "worker_startup_s": 0.4,
+        "overhead_s": 0.4,
     }
     fields.update(overrides)
     return RunRecord(**fields)
@@ -48,7 +49,7 @@ def test_envelope_present() -> None:
 def test_history_roundtrip() -> None:
     history = History(
         tests={"t.py::a": TestHistory(0.0123, 14, "passed", 0, 13)},
-        overhead={"worker_startup_s": 0.41},
+        overhead=Overhead(samples_s={1: 0.4, 2: 0.6}, a=0.2, b=0.2, fit_points=[1, 2]),
         last_merged_runs=["r1"],
     )
     assert History.from_dict(roundtrip(history.to_dict())) == history
@@ -57,7 +58,7 @@ def test_history_roundtrip() -> None:
 def test_run_roundtrip() -> None:
     run = make_run()
     assert RunRecord.from_dict(roundtrip(run.to_dict())) == run
-    no_startup = make_run(worker_startup_s=None)
+    no_startup = make_run(overhead_s=None)
     assert RunRecord.from_dict(roundtrip(no_startup.to_dict())) == no_startup
 
 
@@ -78,7 +79,7 @@ def test_wrong_schema_version_rejected(version: object) -> None:
         (("tests", 0, "duration"), -1, "negative"),
         (("started_at",), "yesterday", "ISO 8601"),
         (("randomly_reorder_disabled",), 1, "randomly_reorder_disabled"),
-        (("worker_startup_s",), "fast", "worker_startup_s"),
+        (("overhead_s",), "fast", "overhead_s"),
     ],
 )
 def test_bad_run_fields_rejected(path: tuple, value: object, match: str) -> None:
@@ -148,3 +149,30 @@ def test_flaky_order_edges_and_validation() -> None:
     data["od_victims"][0]["polluters"] = "p1"
     with pytest.raises(SchemaError):
         Flaky.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    ("samples", "a", "b", "points"),
+    [
+        ({}, 0.0, 0.0, []),
+        ({2: 0.8}, 0.8, 0.0, [2]),  # one point: constant
+        ({1: 0.5, 2: 0.7, 4: 1.1}, 0.3, 0.2, [1, 2, 4]),  # exact line
+        ({1: 0.5, 3: 9.0, 8: 9.0}, 0.5, 0.0, [1]),  # only m in (1, 2, 4) calibrates
+    ],
+)
+def test_overhead_least_squares(samples: dict, a: float, b: float, points: list) -> None:
+    model = Overhead(samples_s=dict(samples))
+    model.refit()
+    assert (model.a, model.b, model.fit_points) == (pytest.approx(a), pytest.approx(b), points)
+
+
+def test_overhead_least_squares_noisy_and_clamped() -> None:
+    model = Overhead(samples_s={1: 1.0, 2: 0.9, 4: 0.4})
+    model.refit()
+    # OLS by hand: mean m = 7/3, mean y = 2.3/3; b = sxy / sxx.
+    mean_m, mean_y = 7 / 3, 2.3 / 3
+    sxy = sum((m - mean_m) * (y - mean_y) for m, y in model.samples_s.items())
+    sxx = sum((m - mean_m) ** 2 for m in model.samples_s)
+    assert model.b == pytest.approx(sxy / sxx)
+    assert model.a == pytest.approx(mean_y - model.b * mean_m)
+    assert model.predict(100) == 0.0  # a negative extrapolation is clamped
