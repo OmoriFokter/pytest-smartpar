@@ -43,7 +43,7 @@ def test_plugin_is_inactive_without_flags(pytester: pytest.Pytester) -> None:
     result.assert_outcomes(passed=1)
 
 
-@pytest.mark.parametrize("flag", ["--smartpar", "--smartpar-profile", "--smartpar-detect"])
+@pytest.mark.parametrize("flag", ["--smartpar", "--smartpar-detect"])
 def test_unimplemented_mode_fails_loudly(pytester: pytest.Pytester, flag: str) -> None:
     pytester.makepyfile("def test_ok(): pass")
     result = pytester.runpytest(flag)

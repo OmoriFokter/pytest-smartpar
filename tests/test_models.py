@@ -101,3 +101,23 @@ def test_missing_field_rejected() -> None:
 def test_not_an_object_rejected() -> None:
     with pytest.raises(SchemaError):
         History.from_dict([])
+
+
+def test_dependencies_roundtrip_and_validation() -> None:
+    from smartpar.models import Dependencies, FileAccess
+
+    deps = Dependencies(
+        file_access={"t::a": FileAccess(R=["<project>/x"], W=[])},
+        state_changes={"t::a": ["env:X"]},
+        order_edges=[{"before": "a", "after": "b", "reason": "r"}],
+        profile_stats={"errors": 0},
+    )
+    assert Dependencies.from_dict(roundtrip(deps.to_dict())) == deps
+    bad = roundtrip(deps.to_dict())
+    bad["profile_stats"] = [1]
+    with pytest.raises(SchemaError, match="profile_stats"):
+        Dependencies.from_dict(bad)
+    bad = roundtrip(deps.to_dict())
+    bad["file_access"]["t::a"]["W"] = "x"
+    with pytest.raises(SchemaError, match="list of strings"):
+        Dependencies.from_dict(bad)

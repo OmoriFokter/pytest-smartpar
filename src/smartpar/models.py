@@ -6,9 +6,9 @@ are the schema: they check the version and the types of the fields they read
 and raise ``SchemaError`` on anything unexpected, so a damaged or foreign file
 is never silently interpreted.
 
-This module covers history.json (step 5) and run files runs/run_*.json
-(step 5). The models of the other files are added with the phases that
-produce them.
+This module covers history.json and run files runs/run_*.json (step 5) and
+dependencies.json (steps 1-2). The models of the other files are added with
+the phases that produce them.
 """
 
 from __future__ import annotations
@@ -212,4 +212,85 @@ class RunRecord:
             tests=[TestRecord.from_dict(t, f"{what} test #{i}") for i, t in enumerate(tests)],
             randomly_reorder_disabled=_get(data, "randomly_reorder_disabled", bool, what),
             worker_startup_s=None if startup is None else float(startup),
+        )
+
+
+# --- dependencies.json -----------------------------------------------------------
+
+
+@dataclass
+class FileAccess:
+    R: list[str] = field(default_factory=list)
+    W: list[str] = field(default_factory=list)
+
+
+def _str_list(value: Any, what: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise SchemaError(f"{what}: expected a list of strings")
+    return list(value)
+
+
+def _dict_list(value: Any, what: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not all(isinstance(v, dict) for v in value):
+        raise SchemaError(f"{what}: expected a list of objects")
+    return list(value)
+
+
+@dataclass
+class Dependencies:
+    """dependencies.json (spec 3.2).
+
+    Paths are resources: ``<project>/relative/path`` inside the project root,
+    absolute paths outside it. ``conflicts`` and ``groups`` are derived by the
+    graph step, ``order_edges`` by the detector; they stay plain objects until
+    those phases define them.
+    """
+
+    file_access: dict[str, FileAccess] = field(default_factory=dict)
+    state_changes: dict[str, list[str]] = field(default_factory=dict)
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
+    order_edges: list[dict[str, Any]] = field(default_factory=list)
+    groups: list[dict[str, Any]] = field(default_factory=list)
+    # Diagnostics of the profiling run: skipped/unresolved audit events,
+    # modules snapshotted in cheap mode, etc.
+    profile_stats: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **envelope(),
+            "file_access": {
+                k: {"R": sorted(v.R), "W": sorted(v.W)} for k, v in sorted(self.file_access.items())
+            },
+            "state_changes": {k: sorted(v) for k, v in sorted(self.state_changes.items())},
+            "conflicts": self.conflicts,
+            "order_edges": self.order_edges,
+            "groups": self.groups,
+            "profile_stats": self.profile_stats,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Dependencies:
+        what = "dependencies.json"
+        data = check_version(data, what)
+        file_access = {}
+        for nodeid, access in _get(data, "file_access", dict, what).items():
+            if not isinstance(access, dict):
+                raise SchemaError(f"{what}: file_access {nodeid!r} is not an object")
+            file_access[nodeid] = FileAccess(
+                R=_str_list(access.get("R"), f"{what}: file_access {nodeid!r} R"),
+                W=_str_list(access.get("W"), f"{what}: file_access {nodeid!r} W"),
+            )
+        state_changes = {
+            k: _str_list(v, f"{what}: state_changes {k!r}")
+            for k, v in _get(data, "state_changes", dict, what).items()
+        }
+        # Optional: absent when the file was created by the detector alone.
+        stats = _get(data, "profile_stats", dict, what) if "profile_stats" in data else {}
+        return cls(
+            file_access=file_access,
+            state_changes=state_changes,
+            conflicts=_dict_list(_get(data, "conflicts", list, what), f"{what}: conflicts"),
+            order_edges=_dict_list(_get(data, "order_edges", list, what), f"{what}: order_edges"),
+            groups=_dict_list(_get(data, "groups", list, what), f"{what}: groups"),
+            profile_stats=stats,
         )

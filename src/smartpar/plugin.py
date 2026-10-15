@@ -8,7 +8,12 @@ scheduling, execution and recording).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+
+from smartpar.profiler import ProfilerPlugin
+from smartpar.report import RunCollector
 
 # True when smartpar switched off pytest-randomly's reordering for this session.
 # Written to plan.json / report.csv as ``randomly_reorder_disabled``.
@@ -22,7 +27,6 @@ RANDOMLY_REORDER_WARNING = (
 # Mode flag -> implementation phase from SPEC.md. Used to fail loudly instead of
 # silently ignoring a mode that does not work yet.
 _UNIMPLEMENTED_MODES = {
-    "smartpar_profile": ("--smartpar-profile", 3),
     "smartpar_detect": ("--smartpar-detect", 6),
     "smartpar": ("--smartpar", 5),
 }
@@ -122,3 +126,58 @@ def pytest_configure(config: pytest.Config) -> None:
             raise pytest.UsageError(
                 f"smartpar: {flag} is not implemented yet (planned in phase {phase})."
             )
+
+    if config.getoption("smartpar_profile"):
+        _start_profiling(config)
+
+
+class _XdistProfileHooks:
+    """xdist-only hooks; registered only when xdist is active (unknown hooks fail validation)."""
+
+    def __init__(self, profiler: ProfilerPlugin) -> None:
+        self.profiler = profiler
+
+    def pytest_configure_node(self, node: object) -> None:
+        self.profiler.configure_node(node)
+
+
+def _smartpar_dir(config: pytest.Config) -> Path:
+    path = Path(config.getoption("smartpar_dir"))
+    return path if path.is_absolute() else Path(config.invocation_params.dir) / path
+
+
+def is_xdist_controller(config: pytest.Config) -> bool:
+    """Same predicate xdist uses to create its DSession (registration order of
+    the two trylast pytest_configure hooks is not guaranteed)."""
+    if hasattr(config, "workerinput") or config.getoption("collectonly"):
+        return False
+    return config.getoption("dist", default="no") != "no" and bool(
+        config.getoption("tx", default=None)
+    )
+
+
+def _xdist_workers(config: pytest.Config) -> int:
+    if not is_xdist_controller(config):
+        return 1
+    try:
+        return int(config.getoption("numprocesses") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _start_profiling(config: pytest.Config) -> None:
+    smartpar_dir = _smartpar_dir(config)
+    profiler = ProfilerPlugin(config, smartpar_dir, is_xdist_controller(config))
+    config.pluginmanager.register(profiler, "smartpar-profiler")
+    if hasattr(config, "workerinput"):
+        return
+    if profiler.is_xdist_controller:
+        config.pluginmanager.register(_XdistProfileHooks(profiler), "smartpar-profiler-xdist")
+    collector = RunCollector(
+        mode="profile",
+        workers=_xdist_workers(config),
+        randomly_reorder_disabled=config.stash[RANDOMLY_REORDER_DISABLED],
+        smartpar_dir=smartpar_dir,
+        merge_alpha=config.getoption("smartpar_alpha"),
+    )
+    config.pluginmanager.register(collector, "smartpar-run-collector")
