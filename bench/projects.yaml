@@ -1,0 +1,54 @@
+# Projects of the experiment. Every git project is pinned to a commit SHA
+# (resolved with `git ls-remote` from the tag in `ref`, which is informational).
+#
+# Candidates: the final choice is made by the authors after
+#   python bench/setup_projects.py --survey
+# `install` and `deselect` of the real projects are first guesses that the
+# survey has to confirm (number of tests, failures "out of the box",
+# network-dependent tests to deselect). Placeholders: {python} - the
+# project's virtualenv interpreter.
+projects:
+  - name: control_project
+    # Inside this repository: copied into the workspace and committed there
+    # as a snapshot, so `git clean -xdf` restores it like any clone.
+    local: examples/control_project
+    tests: tests
+    install: []
+    pytest_args: []
+    deselect: []
+    ground_truth: examples/control_project/ground_truth.json
+
+  - name: rich
+    repo: https://github.com/Textualize/rich.git
+    ref: v13.9.4
+    sha: 43d3b04725ab9731727fb1126e35980c62f32377
+    tests: tests
+    install:
+      - "{python} -m pip install -e ."
+      - "{python} -m pip install attrs"
+    pytest_args: []
+    deselect: []
+    status: candidate
+
+  - name: attrs
+    repo: https://github.com/python-attrs/attrs.git
+    ref: 24.2.0
+    sha: 6771a04893780166e4b7826b63599f43ac30d00a
+    tests: tests
+    install:
+      - "{python} -m pip install -e .[tests]"
+    pytest_args: []
+    deselect: []
+    status: candidate
+
+  - name: pydantic
+    repo: https://github.com/pydantic/pydantic.git
+    ref: v2.9.2
+    sha: 7cedbfb03df82ac55c844c97e6f975359cb51bb9
+    tests: tests
+    install:
+      - "{python} -m pip install -e ."
+      - "{python} -m pip install dirty-equals pytest-mock pytest-examples faker jsonschema"
+    pytest_args: []
+    deselect: []
+    status: candidate

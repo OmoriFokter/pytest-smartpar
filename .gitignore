@@ -10,3 +10,4 @@ build/
 .smartpar/
 bench/results/*
 !bench/results/.gitkeep
+bench/work/
