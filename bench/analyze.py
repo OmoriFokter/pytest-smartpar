@@ -11,6 +11,8 @@ Every number comes from the raw files of the series; nothing is typed in.
   ``S(m) = 1 / (e + (1 - e)/m)`` with the mean ``e`` of a configuration;
 * failures before and after re-runs; false failures = tests that failed in a
   parallel configuration but never failed in the serial runs of the series;
+* runs killed after ``--run-timeout`` are excluded from the times and
+  counted separately (``timeouts`` in the failure table);
 * the method's one-time overhead (profiling + detection) and the break-even
   point: CI runs needed until the time saved per run against the best plain
   xdist configuration with the same m covers it;
@@ -114,9 +116,12 @@ def load_series(series: Path) -> tuple[dict[str, Any], list[dict[str, Any]], dic
 
 
 def group_times(records: Iterable[dict]) -> dict[tuple[str, str, int], list[float]]:
+    """Wall times per (project, config, m); runs killed after the timeout are not
+    measurements and are left out (counted in the failure table)."""
     out: dict[tuple[str, str, int], list[float]] = defaultdict(list)
     for r in records:
-        out[(r["project"], r["config"], r["workers"])].append(r["wall_s"])
+        if not r.get("timed_out"):
+            out[(r["project"], r["config"], r["workers"])].append(r["wall_s"])
     return out
 
 
@@ -177,6 +182,7 @@ def failure_table(
                 "config": config,
                 "workers": m,
                 "runs": len(runs),
+                "timeouts": sum(1 for r in runs if r.get("timed_out")),
                 "failures_before_rerun_mean": mean(len(r["failed_before_rerun"]) for r in runs),
                 "failures_after_rerun_mean": mean(len(r["failed_after_rerun"]) for r in runs),
                 "false_failures_before_rerun": sum(map(len, false_before)) if parallel else "",

@@ -317,3 +317,54 @@ def test_env_marks_uncommitted_tool_changes(monkeypatch: pytest.MonkeyPatch) -> 
     assert info["smartpar_dirty"] is True
     assert info["smartpar_dirty_files"] == [" M src/smartpar/plugin.py"]
     assert len(info["smartpar_sha"]) == 40
+
+
+def test_run_with_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
+    import os
+    import sys
+    import time
+
+    pidfile = tmp_path / "grandchild.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n"
+    )
+    out = run_benchmarks.run_with_timeout(
+        [sys.executable, "-c", script], tmp_path, dict(os.environ), timeout=2
+    )
+    assert out.timed_out and out.exit_code is None
+    assert 2 <= out.wall_s < 30
+    grandchild = int(pidfile.read_text())
+    for _ in range(50):  # the kill is asynchronous; the zombie is reaped shortly after
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("the grandchild (an xdist worker, say) survived the timeout")
+
+
+def test_run_with_timeout_normal_exit(tmp_path: Path) -> None:
+    import os
+    import sys
+
+    out = run_benchmarks.run_with_timeout(
+        [sys.executable, "-c", "print('hi'); raise SystemExit(3)"], tmp_path, dict(os.environ), 30
+    )
+    assert (out.exit_code, out.timed_out) == (3, False)
+    assert "hi" in out.output_tail
+
+
+def test_timed_out_runs_are_not_measurements() -> None:
+    records = [
+        rec("serial", 1, 8.0, []),
+        rec("smartpar", 4, 2.0, []),
+        {**rec("smartpar", 4, 600.0, []), "timed_out": True},
+    ]
+    times = {(r["config"], r["workers"]): r for r in analyze.time_table(records)}
+    assert times[("smartpar", 4)]["mean_s"] == 2.0 and times[("smartpar", 4)]["runs"] == 1
+    failures = {r["config"]: r for r in analyze.failure_table(records)}
+    assert failures["smartpar"]["timeouts"] == 1

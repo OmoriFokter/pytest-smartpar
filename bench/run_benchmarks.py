@@ -27,13 +27,16 @@ describes the machine and versions of the series.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -56,8 +59,54 @@ from bench.setup_projects import (
 )
 
 CONFIGS = ("serial", "xdist-load", "xdist-loadfile", "smartpar")
+PROFILE_TIMEOUT_FACTOR = 3
+
+
+class BenchError(RuntimeError):
+    """A project cannot be benchmarked (e.g. profiling failed or timed out)."""
+
+
 REQUIRED_WORKERS = (2, 4)  # standard GitHub Actions runners
 FAILED = ("failed", "error")
+
+
+@dataclass
+class Outcome:
+    wall_s: float
+    exit_code: int | None  # None: killed after the timeout
+    output_tail: str
+
+    @property
+    def timed_out(self) -> bool:
+        return self.exit_code is None
+
+
+def run_with_timeout(
+    cmd: list[str], cwd: Path, env: dict[str, str], timeout: float | None
+) -> Outcome:
+    """Run ``cmd``; after ``timeout`` seconds kill its whole process group.
+
+    pytest-xdist workers and smartpar's child runs are grandchildren: killing
+    only the direct child would leave them running and skew later runs.
+    """
+    t0 = time.perf_counter()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return Outcome(time.perf_counter() - t0, proc.returncode, out[-4000:])
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        out, _ = proc.communicate()
+        return Outcome(time.perf_counter() - t0, None, (out or "")[-4000:])
 
 
 def config_args(config: str, workers: int, data_dir: Path) -> list[str]:
@@ -87,8 +136,17 @@ def shuffled(jobs: list[tuple[str, int]], seed: int, repeat: int) -> list[tuple[
 
 
 class Bench:
-    def __init__(self, project: Project, work: Path, raw: Path) -> None:
+    def __init__(
+        self,
+        project: Project,
+        work: Path,
+        raw: Path,
+        run_timeout: float | None = None,
+        detect_budget: float | None = None,
+    ) -> None:
         self.project = project
+        self.run_timeout = run_timeout
+        self.detect_budget = detect_budget
         self.work = work
         self.src, venv = project.paths(work)
         self.python = venv_python(venv)
@@ -98,7 +156,7 @@ class Bench:
 
     def pytest(
         self, args: list[str], timing: Path | None = None, timeout: float | None = None
-    ) -> tuple[float, int, str]:
+    ) -> Outcome:
         env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
         env.pop("SMARTPAR_BENCH_TIMING", None)
         if timing is not None:
@@ -117,17 +175,7 @@ class Bench:
             *[f"--deselect={d}" for d in self.project.deselect],
             *args,
         ]
-        t0 = time.perf_counter()
-        proc = subprocess.run(
-            cmd,
-            cwd=self.src,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        return time.perf_counter() - t0, proc.returncode, proc.stdout[-4000:]
+        return run_with_timeout(cmd, self.src, env, timeout)
 
     # --- preparation ---------------------------------------------------------------
 
@@ -138,39 +186,62 @@ class Bench:
             shutil.rmtree(self.master)
         data = ["--smartpar-dir", str(self.master)]
         clean_state(self.project, self.work)
-        # The detector's runs re-enable pytest-randomly themselves.
-        profile_s, profile_rc, _ = self.pytest(["--smartpar-profile", *data])
+        # Profiling is instrumented and serial: allow several plain runs.
+        profile_timeout = PROFILE_TIMEOUT_FACTOR * self.run_timeout if self.run_timeout else None
+        profile = self.pytest(["--smartpar-profile", *data], timeout=profile_timeout)
+        if profile.timed_out or not (self.master / "dependencies.json").exists():
+            raise BenchError(
+                f"{self.project.name}: profiling "
+                + ("timed out" if profile.timed_out else f"failed (exit {profile.exit_code})")
+                + f"\n{profile.output_tail}"
+            )
         shutil.copy(self.master / "dependencies.json", self.raw / "deps_after_profile.json")
-        detect_s, detect_rc, _ = self.pytest(
-            [
-                "--smartpar-detect",
-                "-p",
-                "randomly",
-                "--smartpar-runs",
-                str(detect_runs),
-                "--smartpar-seed",
-                str(detect_seed),
-                *data,
-            ]
-        )
+        # The detector's runs re-enable pytest-randomly themselves.
+        detect_args = [
+            "--smartpar-detect",
+            "-p",
+            "randomly",
+            "--smartpar-runs",
+            str(detect_runs),
+            "--smartpar-seed",
+            str(detect_seed),
+            *data,
+        ]
+        detect_timeout = None
+        if self.detect_budget is not None:
+            detect_args += ["--smartpar-detect-budget", str(self.detect_budget)]
+            # The budget stops new child runs; one running child may still finish.
+            detect_timeout = self.detect_budget + (self.run_timeout or 0) + 60
+        detect = self.pytest(detect_args, timeout=detect_timeout)
         warmup_s = 0.0
+        warmup_timeouts = 0
         for m in workers:
             for _ in range(warmup):
                 clean_state(self.project, self.work)
-                seconds, _rc, _ = self.pytest(["-n", str(m), "--smartpar", *data])
-                warmup_s += seconds
+                run = self.pytest(["-n", str(m), "--smartpar", *data], timeout=self.run_timeout)
+                warmup_s += run.wall_s
+                warmup_timeouts += run.timed_out
                 self._merge(self.master)
         clean_state(self.project, self.work)
+        flaky = self.master / "flaky.json"
+        unresolved = json.loads(flaky.read_text())["unresolved"] if flaky.exists() else None
         prep = {
-            "profile_s": profile_s,
-            "profile_exit_code": profile_rc,
-            "detect_s": detect_s,
-            "detect_exit_code": detect_rc,
+            "profile_s": profile.wall_s,
+            "profile_exit_code": profile.exit_code,
+            "detect_s": detect.wall_s,
+            "detect_exit_code": detect.exit_code,
+            "detect_timed_out": detect.timed_out,
             "detect_runs": detect_runs,
             "detect_seed": detect_seed,
+            "detect_budget_s": self.detect_budget,
+            "detect_budget_hits": None
+            if unresolved is None
+            else sum(1 for u in unresolved if u.get("reason") == "budget"),
             "warmup_runs_per_m": warmup,
             "warmup_s": warmup_s,
-            "overhead_s": profile_s + detect_s,  # one-time cost of the method
+            "warmup_timeouts": warmup_timeouts,
+            "run_timeout_s": self.run_timeout,
+            "overhead_s": profile.wall_s + detect.wall_s,  # one-time cost of the method
         }
         (self.raw / "prep.json").write_text(json.dumps(prep, indent=2))
         return prep
@@ -191,7 +262,8 @@ class Bench:
         data_dir = self.raw / f"{tag}.smartpar"
         if config == "smartpar":
             shutil.copytree(self.master, data_dir)
-        wall, rc, tail = self.pytest(config_args(config, m, data_dir), timing=timing)
+        run = self.pytest(config_args(config, m, data_dir), timing=timing, timeout=self.run_timeout)
+        wall, rc, tail = run.wall_s, run.exit_code, run.output_tail
         tests = [json.loads(x) for x in timing.read_text().splitlines()] if timing.exists() else []
         failed_before = sorted(t["nodeid"] for t in tests if t["outcome"] in FAILED)
         record: dict[str, Any] = {
@@ -202,6 +274,8 @@ class Bench:
             "position": position,
             "wall_s": wall,
             "exit_code": rc,
+            # Killed after --run-timeout: wall_s is the timeout, not a measurement.
+            "timed_out": run.timed_out,
             "tests": len(tests),
             "failed_before_rerun": failed_before,
             # Plain xdist does not re-run anything: after == before.
@@ -248,6 +322,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--warmup", type=int, default=3, help="smartpar runs per m before measuring"
     )
+    parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=None,
+        help="seconds per pytest run; a run that exceeds it is killed (with its workers) "
+        f"and recorded as timed out (profiling gets {PROFILE_TIMEOUT_FACTOR}x)",
+    )
+    parser.add_argument(
+        "--detect-budget",
+        type=float,
+        default=None,
+        help="seconds for --smartpar-detect (passed as --smartpar-detect-budget)",
+    )
     args = parser.parse_args(argv)
 
     cores = physical_cores()
@@ -278,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
         "configs": args.configs,
         "repeats": args.repeats,
         "order_seed": args.order_seed,
+        "run_timeout_s": args.run_timeout,
+        "detect_budget_s": args.detect_budget,
         "projects": {},
     }
     for project in projects:
@@ -304,24 +393,46 @@ def main(argv: list[str] | None = None) -> int:
     (series / "env.json").write_text(json.dumps(env, indent=2))
 
     jobs = jobs_for(args.configs, workers)
+    failed: list[str] = []
     for project in projects:
-        bench = Bench(project, args.work, raw)
+        bench = Bench(project, args.work, raw, args.run_timeout, args.detect_budget)
         print(f"== {project.name}: preparing (profile, detect, warm-up)")
-        prep = bench.prepare(workers, args.detect_runs, args.detect_seed, args.warmup)
+        try:
+            prep = bench.prepare(workers, args.detect_runs, args.detect_seed, args.warmup)
+        except (BenchError, subprocess.CalledProcessError, OSError) as exc:
+            # One broken project must not stop the series for the others.
+            failed.append(project.name)
+            (bench.raw / "error.txt").write_text(str(exc))
+            print(f"   FAILED, skipping the project: {exc}")
+            continue
+        if prep["detect_budget_hits"] or prep["detect_timed_out"]:
+            print(
+                f"   WARNING: the detection budget ran out ({prep['detect_budget_hits']} tests "
+                "unresolved for lack of budget): undetected order dependencies can make "
+                "smartpar runs fail - raise --detect-budget for the article series"
+            )
         print(
-            f"   profile {prep['profile_s']:.1f}s, detect {prep['detect_s']:.1f}s, "
-            f"warm-up {prep['warmup_s']:.1f}s"
+            f"   profile {prep['profile_s']:.1f}s, detect {prep['detect_s']:.1f}s"
+            + (" (timed out)" if prep["detect_timed_out"] else "")
+            + f", warm-up {prep['warmup_s']:.1f}s"
         )
         for repeat in range(args.repeats):
             order = shuffled(jobs, args.order_seed, repeat)
             (bench.raw / f"order_r{repeat}.json").write_text(json.dumps(order))
             for position, (config, m) in enumerate(order):
                 rec = bench.measure(config, m, repeat, position)
-                print(
-                    f"   r{repeat} {config:15s} m={m}: {rec['wall_s']:6.2f}s "
-                    f"failed {len(rec['failed_before_rerun'])}/{len(rec['failed_after_rerun'])}"
+                status = (
+                    "TIMEOUT"
+                    if rec["timed_out"]
+                    else (
+                        f"failed {len(rec['failed_before_rerun'])}/{len(rec['failed_after_rerun'])}"
+                    )
                 )
+                print(f"   r{repeat} {config:15s} m={m}: {rec['wall_s']:6.2f}s {status}")
     print(f"series written to {series}")
+    if failed:
+        print(f"projects skipped after errors: {', '.join(failed)} (see raw/<project>/error.txt)")
+        return 1
     return 0
 
 
