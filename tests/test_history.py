@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -112,29 +113,31 @@ def test_load_history(tmp_path: Path) -> None:
 def test_apply_run_ema_and_counters() -> None:
     h = History()
     history.apply_run(h, make_run("r1", T0, {"a": 1.0}, startup=0.5), alpha=0.3)
-    assert h.tests["a"].duration_ema == 1.0  # first observation initializes
+    assert h.tests["a"].duration_ema == 1.0  # first passed run initializes
     history.apply_run(h, make_run("r2", T0, {"a": 2.0}, startup=1.0), alpha=0.3)
     assert h.tests["a"].duration_ema == pytest.approx(0.3 * 2.0 + 0.7 * 1.0)
     assert h.overhead["worker_startup_s"] == pytest.approx(0.3 * 1.0 + 0.7 * 0.5)
-    history.apply_run(h, make_run("r3", T0, {"a": 9.0}, outcome="failed"), alpha=0.3)
     entry = h.tests["a"]
     assert (entry.runs, entry.timed_runs, entry.fail_count, entry.last_outcome) == (
-        3,
-        3,
-        1,
-        "failed",
+        2,
+        2,
+        0,
+        "passed",
     )
 
 
-def test_apply_run_skipped_does_not_touch_duration() -> None:
+@pytest.mark.parametrize("outcome", ["failed", "error", "skipped", "xfailed", "xpassed"])
+def test_apply_run_only_passed_updates_duration(outcome: str) -> None:
     h = History()
-    history.apply_run(h, make_run("r1", T0, {"a": 0.0}, outcome="skipped"), alpha=0.3)
-    assert (h.tests["a"].runs, h.tests["a"].timed_runs) == (1, 0)
+    history.apply_run(h, make_run("r1", T0, {"a": 9.0}, outcome=outcome), alpha=0.3)
+    assert (h.tests["a"].runs, h.tests["a"].timed_runs, h.tests["a"].duration_ema) == (1, 0, 0.0)
     history.apply_run(h, make_run("r2", T0, {"a": 2.0}), alpha=0.3)
-    assert h.tests["a"].duration_ema == 2.0  # first *timed* run initializes
-    history.apply_run(h, make_run("r3", T0, {"a": 0.0}, outcome="skipped"), alpha=0.3)
-    assert h.tests["a"].duration_ema == 2.0
-    assert h.tests["a"].last_outcome == "skipped"
+    assert h.tests["a"].duration_ema == 2.0  # first *passed* run initializes
+    history.apply_run(h, make_run("r3", T0, {"a": 9.0}, outcome=outcome), alpha=0.3)
+    entry = h.tests["a"]
+    assert entry.duration_ema == 2.0
+    assert (entry.runs, entry.timed_runs, entry.last_outcome) == (3, 1, outcome)
+    assert entry.fail_count == (2 if outcome in ("failed", "error") else 0)
 
 
 # --- merge --------------------------------------------------------------------------
@@ -161,31 +164,97 @@ def test_merge_moves_files_and_is_idempotent(tmp_path: Path) -> None:
     assert history.load_history(tmp_path) == before
 
 
-def test_merge_resumes_after_crash_without_double_count(
+def _crash_when(monkeypatch: pytest.MonkeyPatch, predicate: Callable[[str], bool]) -> None:
+    """Simulate the process being killed at the first os.replace matching predicate."""
+    real_replace = os.replace
+
+    def replace(src: object, dst: object) -> None:
+        if predicate(str(dst)):
+            raise KeyboardInterrupt
+        real_replace(src, dst)
+
+    monkeypatch.setattr(history.os, "replace", replace)
+
+
+def test_merge_leaves_last_merged_runs_empty(tmp_path: Path) -> None:
+    history.write_run(tmp_path, make_run("run_1", T0, {"t": 1.0}))
+    history.merge(tmp_path)
+    assert history.load_history(tmp_path).last_merged_runs == []
+
+
+def test_crash_between_history_write_and_move(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     history.write_run(tmp_path, make_run("run_1", T0, {"t": 1.0}))
-    real_replace = os.replace
-
-    def crash_on_move(src: object, dst: object) -> None:
-        if "merged" in str(dst):
-            raise KeyboardInterrupt  # process killed between write and move
-        real_replace(src, dst)
-
-    monkeypatch.setattr(history.os, "replace", crash_on_move)
+    _crash_when(monkeypatch, lambda dst: "merged" in dst)
     with pytest.raises(KeyboardInterrupt):
         history.merge(tmp_path)
     monkeypatch.undo()
 
-    assert history.load_history(tmp_path).tests["t"].runs == 1
+    crashed = history.load_history(tmp_path)
+    assert crashed.tests["t"].runs == 1
+    assert crashed.last_merged_runs == ["run_1"]
+    assert [p.name for p in history.iter_run_files(tmp_path)] == ["run_1.json"]
+
     history.write_run(tmp_path, make_run("run_2", T0 + timedelta(seconds=1), {"t": 3.0}))
     result = history.merge(tmp_path, alpha=0.5)
     assert result.already_merged == ["run_1"]
     assert result.merged == ["run_2"]
-    entry = history.load_history(tmp_path).tests["t"]
-    assert entry.runs == 2
-    assert entry.duration_ema == pytest.approx(2.0)
+    recovered = history.load_history(tmp_path)
+    assert recovered.tests["t"].runs == 2  # run_1 not counted twice
+    assert recovered.tests["t"].duration_ema == pytest.approx(2.0)
+    assert recovered.last_merged_runs == []
     assert not list(history.iter_run_files(tmp_path))
+
+
+def test_crash_after_move_before_list_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history.write_run(tmp_path, make_run("run_1", T0, {"t": 1.0}))
+    calls = {"history": 0}
+
+    def second_history_write(dst: str) -> bool:
+        if dst.endswith("history.json"):
+            calls["history"] += 1
+            return calls["history"] == 2
+        return False
+
+    _crash_when(monkeypatch, second_history_write)
+    with pytest.raises(KeyboardInterrupt):
+        history.merge(tmp_path)
+    monkeypatch.undo()
+
+    assert history.load_history(tmp_path).last_merged_runs == ["run_1"]  # stale id
+    assert not list(history.iter_run_files(tmp_path))
+    result = history.merge(tmp_path)
+    assert result.merged == [] and result.already_merged == []
+    healed = history.load_history(tmp_path)
+    assert healed.last_merged_runs == []
+    assert healed.tests["t"].runs == 1
+
+
+def test_late_run_with_earlier_start_is_merged(tmp_path: Path) -> None:
+    # A run that started earlier but whose file arrives after a merge must
+    # still be folded in (no time watermark). With incremental merges its
+    # effect on the EMA depends on when it is merged - documented limitation.
+    alpha = 0.3  # not 0.5: with two runs the EMA would be order-symmetric
+    history.write_run(tmp_path, make_run("run_later", T0 + timedelta(seconds=10), {"t": 4.0}))
+    history.merge(tmp_path, alpha=alpha)
+    history.write_run(tmp_path, make_run("run_early", T0, {"t": 1.0}))
+    result = history.merge(tmp_path, alpha=alpha)
+    assert result.merged == ["run_early"]
+    incremental = history.load_history(tmp_path).tests["t"]
+    assert incremental.runs == 2
+    assert incremental.duration_ema == pytest.approx(0.3 * 1.0 + 0.7 * 4.0)  # applied last
+
+    # The same two runs in one merge are applied in start-time order.
+    one_shot = tmp_path / "one_shot"
+    history.write_run(one_shot, make_run("run_later", T0 + timedelta(seconds=10), {"t": 4.0}))
+    history.write_run(one_shot, make_run("run_early", T0, {"t": 1.0}))
+    history.merge(one_shot, alpha=alpha)
+    single = history.load_history(one_shot).tests["t"]
+    assert single.duration_ema == pytest.approx(0.3 * 4.0 + 0.7 * 1.0)
+    assert single.duration_ema != pytest.approx(incremental.duration_ema)
 
 
 def test_merge_skips_invalid_run_file(tmp_path: Path) -> None:

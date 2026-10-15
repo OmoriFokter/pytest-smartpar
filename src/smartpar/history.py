@@ -142,16 +142,18 @@ def iter_run_files(smartpar_dir: Path) -> Iterator[Path]:
 def apply_run(history: History, run: RunRecord, alpha: float) -> None:
     """Fold one run into the history (EMA of durations, counters).
 
-    The first observation of a test initializes its EMA. Skipped tests update
-    the counters but not the EMA: their duration says nothing about the cost
-    of actually running them.
+    Only passed runs update ``duration_ema`` and ``timed_runs``: a skipped test
+    did not do its work, and a failed one may have stopped early or hung, so
+    neither duration estimates the cost of a normal run. The first passed run
+    initializes the EMA. ``runs``, ``last_outcome`` and ``fail_count`` count
+    every run.
     """
     for rec in run.tests:
         entry = history.tests.setdefault(
             rec.nodeid,
             TestHistory(duration_ema=0.0, runs=0, last_outcome="", fail_count=0, timed_runs=0),
         )
-        if rec.outcome != "skipped":
+        if rec.outcome == "passed":
             if entry.timed_runs == 0:
                 entry.duration_ema = rec.duration
             else:
@@ -201,9 +203,17 @@ def _run_sort_key(run: RunRecord) -> tuple[datetime, str]:
 def merge(smartpar_dir: Path, alpha: float = DEFAULT_ALPHA) -> MergeResult:
     """Fold all pending run files into history.json and move them to runs/merged/.
 
-    Crash safety: history.json is written (with the list of merged run ids)
-    *before* the run files are moved. If the process dies in between, the next
-    merge recognizes those runs by id and only moves them.
+    Crash safety (two-phase):
+
+    1. history.json is written with the folded runs *and* their ids in
+       ``last_merged_runs``;
+    2. the run files are moved to runs/merged/, then history.json is written
+       again with those ids removed, so the list stays empty between merges.
+
+    A crash between 1 and 2 leaves run files whose ids are listed: the next
+    merge only moves them. A crash after the move but before the second write
+    leaves ids without files: the next merge drops them. No time watermark is
+    used, so a late run with an earlier ``started_at`` is never lost.
     """
     if not 0 < alpha <= 1:
         raise ValueError(f"alpha must be in (0, 1], got {alpha}")
@@ -232,12 +242,20 @@ def merge(smartpar_dir: Path, alpha: float = DEFAULT_ALPHA) -> MergeResult:
             apply_run(history, run, alpha)
             result.merged.append(run.run_id)
 
+        # Phase 1: ids of every run folded in but not yet moved.
+        in_flight = sorted(result.already_merged + result.merged)
         if pending:
-            history.last_merged_runs = list(result.merged)
+            history.last_merged_runs = in_flight
             save_history(smartpar_dir, history)
 
         merged_dir = smartpar_dir / RUNS_DIR / MERGED_DIR
         merged_dir.mkdir(parents=True, exist_ok=True)
         for path in [p for _r, p in pending] + leftovers:
             os.replace(path, merged_dir / path.name)
+
+        # Phase 2: all those files are moved; ids listed without a file
+        # (crash after a previous move) are dropped as well.
+        if history.last_merged_runs:
+            history.last_merged_runs = []
+            save_history(smartpar_dir, history)
     return result

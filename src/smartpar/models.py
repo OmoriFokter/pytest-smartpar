@@ -73,7 +73,7 @@ class TestHistory:
     runs: int
     last_outcome: str
     fail_count: int
-    # Runs that contributed to duration_ema (skipped runs do not).
+    # Passed runs, the only ones that contribute to duration_ema.
     timed_runs: int
 
     @classmethod
@@ -94,9 +94,9 @@ class History:
     tests: dict[str, TestHistory] = field(default_factory=dict)
     # Measured overheads, e.g. {"worker_startup_s": 0.41}.
     overhead: dict[str, float] = field(default_factory=dict)
-    # Run ids folded in by the most recent merge. Lets a merge that crashed
-    # after writing history.json but before moving the run files be resumed
-    # without counting those runs twice.
+    # Run ids folded into this history whose files may still be in runs/.
+    # Non-empty only if a merge was interrupted between writing history.json
+    # and moving the run files; lets the next merge avoid counting them twice.
     last_merged_runs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,7 +131,11 @@ class History:
 
 @dataclass
 class TestRecord:
-    """One test in one run. Timestamps are ``time.time()`` seconds."""
+    """One test in one run.
+
+    ``duration`` is setup + call + teardown in seconds; ``start``/``end`` are
+    ``time.time()`` timestamps.
+    """
 
     __test__ = False
 
