@@ -47,7 +47,10 @@ minversion = "8.0"
 testpaths = ["tests"]
 # pytester runs pytest sessions in-process; the order of the tool's own tests
 # must be deterministic, so pytest-randomly is disabled here.
-addopts = "-p pytester -p no:randomly"
+addopts = "-p pytester -p no:randomly -m 'not control'"
+markers = [
+    "control: end-to-end run on examples/control_project (slow); run with -m control",
+]
 
 [tool.ruff]
 line-length = 100

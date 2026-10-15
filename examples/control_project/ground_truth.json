@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "description": "Everything planted in the control project. The method must find exactly the file_conflicts, od_pairs and brittle pairs (precision = recall = 1); NOD tests must never be reported as order-dependent; tests in restored_state must have no state_changes.",
+  "test_count": 200,
+  "file_conflicts": [
+    {
+      "a": "tests/test_storage.py::test_c1_a_write_report",
+      "b": "tests/test_storage.py::test_c1_b_read_report",
+      "resource": "<project>/output/report.txt",
+      "kind": "W-R"
+    },
+    {
+      "a": "tests/test_storage.py::test_c2_a_write_index",
+      "b": "tests/test_storage.py::test_c2_b_read_index",
+      "resource": "<project>/output/index.json",
+      "kind": "W-R"
+    },
+    {
+      "a": "tests/test_storage.py::test_c3_a_read_cache",
+      "b": "tests/test_storage.py::test_c3_b_write_cache",
+      "resource": "<project>/output/cache.bin",
+      "kind": "R-W"
+    },
+    {
+      "a": "tests/test_storage.py::test_c4_a_read_log",
+      "b": "tests/test_storage.py::test_c4_b_write_log",
+      "resource": "<project>/output/app.log",
+      "kind": "R-W"
+    },
+    {
+      "a": "tests/test_storage.py::test_c5_a_write_lock",
+      "b": "tests/test_storage.py::test_c5_b_write_lock",
+      "resource": "<project>/output/lock.txt",
+      "kind": "W-W"
+    },
+    {
+      "a": "tests/test_storage.py::test_c6_a_export",
+      "b": "tests/test_storage.py::test_c6_b_export",
+      "resource": "<project>/output/export.csv",
+      "kind": "W-W"
+    }
+  ],
+  "od_pairs": [
+    {
+      "polluter": "tests/test_prices.py::test_switch_to_usd",
+      "victim": "tests/test_prices.py::test_format_uah",
+      "mechanism": "module-level dict"
+    },
+    {
+      "polluter": "tests/test_rates.py::test_override_usd_rate",
+      "victim": "tests/test_rates.py::test_usd_rate",
+      "mechanism": "lru_cache"
+    },
+    {
+      "polluter": "tests/test_i18n.py::test_set_english_locale",
+      "victim": "tests/test_i18n.py::test_default_locale",
+      "mechanism": "os.environ"
+    },
+    {
+      "polluter": "tests/test_workdir.py::test_enter_package_dir",
+      "victim": "tests/test_workdir.py::test_relative_ini_path",
+      "mechanism": "os.chdir"
+    },
+    {
+      "polluter": "tests/test_registry.py::test_enable_debug_mode",
+      "victim": "tests/test_registry.py::test_registry_default_mode",
+      "mechanism": "singleton class attribute"
+    }
+  ],
+  "brittle": [
+    {
+      "setter": "tests/test_i18n.py::test_set_api_token",
+      "test": "tests/test_i18n.py::test_token_present",
+      "mechanism": "os.environ"
+    },
+    {
+      "setter": "tests/test_registry.py::test_register_csv_plugin",
+      "test": "tests/test_registry.py::test_csv_plugin_available",
+      "mechanism": "module-level list"
+    },
+    {
+      "setter": "tests/test_registry.py::test_initialize",
+      "test": "tests/test_registry.py::test_requires_initialized",
+      "mechanism": "module-level flag"
+    }
+  ],
+  "nod": [
+    {
+      "test": "tests/test_nod.py::test_flaky_network_simulation",
+      "fail_probability": 0.2
+    },
+    {
+      "test": "tests/test_nod.py::test_flaky_timing_simulation",
+      "fail_probability": 0.2
+    }
+  ],
+  "long_tests": {
+    "tests/test_slow.py::test_long[0.3]": 0.3,
+    "tests/test_slow.py::test_long[0.4]": 0.4,
+    "tests/test_slow.py::test_long[0.5]": 0.5,
+    "tests/test_slow.py::test_long[0.6]": 0.6,
+    "tests/test_slow.py::test_long[0.7]": 0.7,
+    "tests/test_slow.py::test_long[0.8]": 0.8,
+    "tests/test_slow.py::test_long[0.9]": 0.9,
+    "tests/test_slow.py::test_long[1.0]": 1.0,
+    "tests/test_slow.py::test_long[1.2]": 1.2,
+    "tests/test_slow.py::test_long[1.5]": 1.5
+  },
+  "restored_state": [
+    "tests/test_prices.py::test_temporary_currency",
+    "tests/test_i18n.py::test_locale_with_monkeypatch",
+    "tests/test_workdir.py::test_chdir_with_monkeypatch",
+    "tests/test_registry.py::test_registry_with_monkeypatch"
+  ]
+}
