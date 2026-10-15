@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from smartpar.profiler import ProfilerPlugin
+from smartpar.profiler import DEFAULT_IGNORE_STATE, ProfilerPlugin
 from smartpar.report import RunCollector
 
 # True when smartpar switched off pytest-randomly's reordering for this session.
@@ -33,6 +33,13 @@ _UNIMPLEMENTED_MODES = {
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addini(
+        "smartpar_ignore_state",
+        type="linelist",
+        default=list(DEFAULT_IGNORE_STATE),
+        help="fnmatch patterns of state keys ignored by --smartpar-profile "
+        "(replaces the default list: " + ", ".join(DEFAULT_IGNORE_STATE) + ")",
+    )
     group = parser.getgroup("smartpar", "dependency-aware parallel test execution")
     group.addoption(
         "--smartpar",

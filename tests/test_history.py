@@ -140,6 +140,17 @@ def test_apply_run_only_passed_updates_duration(outcome: str) -> None:
     assert entry.fail_count == (2 if outcome in ("failed", "error") else 0)
 
 
+def test_profile_runs_update_counters_only() -> None:
+    h = History()
+    history.apply_run(h, make_run("r1", T0, {"a": 1.0}), alpha=0.3)
+    profile_run = make_run("r2", T0, {"a": 50.0, "b": 9.0}, startup=7.0)
+    profile_run.mode = "profile"
+    history.apply_run(h, profile_run, alpha=0.3)
+    assert (h.tests["a"].duration_ema, h.tests["a"].timed_runs, h.tests["a"].runs) == (1.0, 1, 2)
+    assert (h.tests["b"].duration_ema, h.tests["b"].timed_runs, h.tests["b"].runs) == (0.0, 0, 1)
+    assert "worker_startup_s" not in h.overhead
+
+
 # --- merge --------------------------------------------------------------------------
 
 

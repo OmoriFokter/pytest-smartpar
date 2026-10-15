@@ -147,8 +147,11 @@ class Unpicklable:
 def test_fingerprint_fallbacks() -> None:
     assert profiler.fingerprint({"a": 1}) == profiler.fingerprint({"a": 1})
     assert profiler.fingerprint({"a": 1}) != profiler.fingerprint({"a": 2})
-    assert profiler.fingerprint(Unpicklable(1))[0] == "r"
+    assert profiler.fingerprint(Unpicklable(1))[0] == "d"  # shallow vars(obj)
     assert profiler.fingerprint(Unpicklable(1)) != profiler.fingerprint(Unpicklable(2))
+    same = Unpicklable(1)
+    assert profiler.fingerprint(same) == profiler.fingerprint(same)
+    assert profiler.fingerprint(__import__("threading").Lock())[0] == "r"  # no __dict__
     assert profiler.fingerprint("x" * 10_000)[0] == "p"
     cheap = profiler.fingerprint([1, 2, 3], cheap=True)
     assert cheap[0] == "c" and cheap[1] == "list" and cheap[3] == 3
@@ -171,6 +174,13 @@ class Registry:
     def method(self): pass
     @property
     def prop(self): return 1
+class LockedRegistry:
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()  # makes the instance unpicklable
+        self.items = []
+        self.currency = "UAH"
+registry = LockedRegistry()
 """,
         module.__dict__,
     )
@@ -185,6 +195,7 @@ def test_module_fingerprints_selects_data(tmp_path: Path) -> None:
         "fakepkg.state.COUNTER",
         "fakepkg.state.rate",
         "fakepkg.state.Registry._instance",
+        "fakepkg.state.registry",
     }
 
 
@@ -216,12 +227,81 @@ def test_snapshot_diff_detects_unrestored_changes(
     monkeypatch.chdir(root)
     after = snap.take()
     assert profiler.diff(before, after) == [
+        "cache_growth:fakepkg.state.rate",
         "cwd",
         "env:SMARTPAR_TEST_VAR",
         "fakepkg.state.Registry._instance",
         "fakepkg.state.SETTINGS",
-        "fakepkg.state.rate",
     ]
+
+
+def test_unpicklable_singleton_instance_change_is_detected(
+    project: tuple[Path, types.ModuleType],
+) -> None:
+    root, module = project
+    snap = StateSnapshotter(root)
+    before = snap.take()
+    module.registry.currency = "USD"  # registry = LockedRegistry(): has a Lock
+    assert profiler.diff(before, snap.take()) == ["fakepkg.state.registry"]
+    before = snap.take()
+    module.registry.items.append("x")  # shallow vars(): a picklable attribute's content
+    assert profiler.diff(before, snap.take()) == ["fakepkg.state.registry"]
+
+
+def test_cache_clear_is_a_plain_state_change(project: tuple[Path, types.ModuleType]) -> None:
+    root, module = project
+    module.rate("abc")
+    snap = StateSnapshotter(root)
+    before = snap.take()
+    module.rate.cache_clear()
+    assert profiler.diff(before, snap.take()) == ["fakepkg.state.rate"]
+
+
+def test_diff_ignore_patterns(
+    project: tuple[Path, types.ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, module = project
+    snap = StateSnapshotter(root)
+    before = snap.take()
+    monkeypatch.setenv("COV_CORE_SOURCE", "x")
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw9")
+    monkeypatch.setenv("APP_KEEP", "1")
+    module.COUNTER = 5
+    after = snap.take()
+    assert profiler.diff(before, after, profiler.DEFAULT_IGNORE_STATE) == [
+        "env:APP_KEEP",
+        "fakepkg.state.COUNTER",
+    ]
+    assert profiler.diff(before, after, ["env:*", "fakepkg.*"]) == []
+
+
+def test_new_module_becomes_baseline_and_import_side_effects_are_recorded(
+    project: tuple[Path, types.ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, module = project
+    snap = StateSnapshotter(root)
+    monkeypatch.delenv("SMARTPAR_IMPORT_SIDE_EFFECT", raising=False)
+
+    # Test A imports a new project module whose import mutates an already
+    # loaded module and the environment.
+    before_a = snap.take()
+    late = types.ModuleType("fakepkg.late")
+    late.__file__ = str(root / "pkg" / "late.py")
+    late.FLAG = "initial"
+    module.SETTINGS["currency"] = "EUR"  # side effect of importing fakepkg.late
+    os.environ["SMARTPAR_IMPORT_SIDE_EFFECT"] = "1"
+    monkeypatch.setitem(sys.modules, "fakepkg.late", late)
+    after_a = snap.take()
+    assert profiler.diff(before_a, after_a) == [
+        "env:SMARTPAR_IMPORT_SIDE_EFFECT",
+        "fakepkg.state.SETTINGS",
+    ]  # the new module's own attributes are not a change
+
+    # Test B: the new module is now part of the baseline.
+    before_b = snap.take()
+    assert "fakepkg.late" in before_b.modules
+    late.FLAG = "changed"
+    assert profiler.diff(before_b, snap.take()) == ["fakepkg.late.FLAG"]
 
 
 def test_snapshot_restored_change_and_new_module_are_not_changes(
@@ -390,7 +470,7 @@ def test_profile_serial(profiled_project: pytest.Pytester, monkeypatch: pytest.M
     assert changes == {
         NODE + "test_pollute_dict": ["app.state.SETTINGS"],
         NODE + "test_singleton": ["app.state.Registry._instance"],
-        NODE + "test_cache": ["app.state.rate"],
+        NODE + "test_cache": ["cache_growth:app.state.rate"],
         NODE + "test_env": ["env:APP_CURRENCY"],
         NODE + "test_chdir": ["cwd"],
         NODE + "test_sys_path": ["sys.path"],
@@ -527,8 +607,11 @@ def test_run_record_outcomes_and_durations(pytester: pytest.Pytester) -> None:
     assert passed["duration"] >= 0.15  # setup + call + teardown
     assert passed["end"] - passed["start"] >= 0.15
     hist = json.loads((pytester.path / ".smartpar" / "history.json").read_text())["tests"]
-    assert hist["test_outcomes.py::test_passed"]["timed_runs"] == 1
-    assert hist["test_outcomes.py::test_failed"]["timed_runs"] == 0
+    # Profiling runs are instrumented: counters only, no durations.
+    assert json.loads(merged[0].read_text())["mode"] == "profile"
+    assert hist["test_outcomes.py::test_passed"]["runs"] == 1
+    assert hist["test_outcomes.py::test_passed"]["timed_runs"] == 0
+    assert hist["test_outcomes.py::test_passed"]["duration_ema"] == 0.0
     assert hist["test_outcomes.py::test_teardown_error"]["fail_count"] == 1
 
 
@@ -543,3 +626,38 @@ def test_audit_hook_does_not_break_file_heavy_tests(pytester: pytest.Pytester) -
     )
     result = pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
     result.assert_outcomes(passed=1)
+
+
+def test_ignore_state_ini_option(pytester: pytest.Pytester) -> None:
+    pytester.makeini(
+        "[pytest]\npythonpath = .\nsmartpar_ignore_state =\n"
+        "    env:PYTEST_CURRENT_TEST\n    env:APP_*\n    cwd\n"
+    )
+    pytester.makepyfile(
+        """
+        import os
+        def test_env():
+            os.environ["APP_CURRENCY"] = "USD"
+            os.environ["COV_CORE_SOURCE"] = "x"  # default pattern replaced by the ini list
+            os.chdir("/")
+        """
+    )
+    pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
+    deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
+    assert deps["state_changes"] == {
+        "test_ignore_state_ini_option.py::test_env": ["env:COV_CORE_SOURCE"]
+    }
+
+
+def test_default_ignore_state(pytester: pytest.Pytester) -> None:
+    pytester.makepyfile(
+        """
+        import os
+        def test_env():
+            os.environ["COV_CORE_DATAFILE"] = "x"
+            os.environ["PYTEST_XDIST_WORKER_COUNT"] = "3"
+        """
+    )
+    pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
+    deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
+    assert deps["state_changes"] == {}

@@ -28,6 +28,7 @@ from typing import Any
 
 from smartpar.models import (
     FAILED_OUTCOMES,
+    UNTIMED_MODES,
     History,
     RunRecord,
     SchemaError,
@@ -145,15 +146,17 @@ def apply_run(history: History, run: RunRecord, alpha: float) -> None:
     Only passed runs update ``duration_ema`` and ``timed_runs``: a skipped test
     did not do its work, and a failed one may have stopped early or hung, so
     neither duration estimates the cost of a normal run. The first passed run
-    initializes the EMA. ``runs``, ``last_outcome`` and ``fail_count`` count
-    every run.
+    initializes the EMA. Runs in an instrumented mode (``UNTIMED_MODES``, e.g.
+    profiling) never update durations. ``runs``, ``last_outcome`` and
+    ``fail_count`` count every run.
     """
+    timed = run.mode not in UNTIMED_MODES
     for rec in run.tests:
         entry = history.tests.setdefault(
             rec.nodeid,
             TestHistory(duration_ema=0.0, runs=0, last_outcome="", fail_count=0, timed_runs=0),
         )
-        if rec.outcome == "passed":
+        if timed and rec.outcome == "passed":
             if entry.timed_runs == 0:
                 entry.duration_ema = rec.duration
             else:
@@ -162,7 +165,7 @@ def apply_run(history: History, run: RunRecord, alpha: float) -> None:
         entry.runs += 1
         entry.last_outcome = rec.outcome
         entry.fail_count += int(rec.outcome in FAILED_OUTCOMES)
-    if run.worker_startup_s is not None:
+    if timed and run.worker_startup_s is not None:
         prev = history.overhead.get("worker_startup_s")
         history.overhead["worker_startup_s"] = (
             run.worker_startup_s

@@ -24,6 +24,9 @@ SCHEMA_VERSION = 1
 # Outcomes that count as a failure of the test in history.json.
 FAILED_OUTCOMES = frozenset({"failed", "error"})
 OUTCOMES = frozenset({"passed", "failed", "error", "skipped", "xfailed", "xpassed"})
+# Run modes whose timings are distorted by instrumentation: such runs update
+# the counters in history.json but not duration_ema.
+UNTIMED_MODES = frozenset({"profile"})
 
 
 class SchemaError(ValueError):

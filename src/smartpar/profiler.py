@@ -24,6 +24,7 @@ Limitations (documented in README):
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import functools
 import inspect
 import json
@@ -54,8 +55,16 @@ WORKERINPUT_TOKEN = "smartpar_profile_token"
 # A module whose snapshot takes longer than this switches to cheap mode.
 SNAPSHOT_BUDGET_S = 0.05
 REPR_LIMIT = 4096
-# Maintained by pytest itself around every test phase.
-VOLATILE_ENV = frozenset({"PYTEST_CURRENT_TEST"})
+# Default of the ini option ``smartpar_ignore_state`` (fnmatch patterns over
+# state keys): variables maintained by pytest, xdist and pytest-cov themselves.
+DEFAULT_IGNORE_STATE = (
+    "env:PYTEST_CURRENT_TEST",
+    "env:PYTEST_XDIST_WORKER",
+    "env:PYTEST_XDIST_WORKER_COUNT",
+    "env:COV_CORE_*",
+)
+# Category prefix for a grown functools cache (filled, not reconfigured).
+CACHE_GROWTH = "cache_growth:"
 
 # --- file access via audit hook --------------------------------------------------
 
@@ -200,13 +209,38 @@ def _cheap_fingerprint(value: Any) -> tuple[Any, ...]:
     return ("c", type(value).__qualname__, id(value), size)
 
 
+def _leaf_fingerprint(value: Any) -> tuple[Any, ...]:
+    try:
+        return ("p", hash(pickle.dumps(value, protocol=5)))
+    except Exception:
+        pass
+    try:
+        return ("r", repr(value)[:REPR_LIMIT])
+    except Exception:
+        return _cheap_fingerprint(value)
+
+
 def fingerprint(value: Any, cheap: bool = False) -> tuple[Any, ...]:
+    """pickle hash; for unpicklable objects with ``__dict__`` a shallow
+    fingerprint of ``vars(obj)`` (a default repr would hide changes of a
+    singleton instance's contents); otherwise repr, otherwise id+type."""
     if cheap:
         return _cheap_fingerprint(value)
     try:
         return ("p", hash(pickle.dumps(value, protocol=5)))
     except Exception:
         pass
+    attrs = getattr(value, "__dict__", None)
+    if isinstance(attrs, dict) and not isinstance(value, (type, ModuleType)):
+        try:
+            items = sorted(attrs.items(), key=lambda kv: str(kv[0]))
+            return (
+                "d",
+                type(value).__qualname__,
+                tuple((str(k), _leaf_fingerprint(v)) for k, v in items),
+            )
+        except Exception:
+            pass
     try:
         return ("r", repr(value)[:REPR_LIMIT])
     except Exception:
@@ -258,14 +292,36 @@ class Snapshot:
     slow_modules: dict[str, float] = field(default_factory=dict)
 
 
-def diff(before: Snapshot, after: Snapshot) -> list[str]:
-    """Keys whose value differs. Modules imported during the test are not a change."""
+def _changed_key(key: str, old: Any, new: Any) -> str:
+    """A grown functools cache gets its own category; a cleared one is a real change."""
+    if (
+        isinstance(old, tuple)
+        and isinstance(new, tuple)
+        and old[:1] == new[:1] == ("cache",)
+        and new[1] > old[1]
+    ):
+        return CACHE_GROWTH + key
+    return key
+
+
+def diff(before: Snapshot, after: Snapshot, ignore: Iterable[str] = ()) -> list[str]:
+    """Keys whose value differs, minus keys matching an ``ignore`` pattern.
+
+    Modules imported during the test are not a change themselves (they become
+    the baseline for later tests); side effects of their import on modules
+    already loaded or on the environment are.
+    """
+    patterns = tuple(ignore)
     changed: set[str] = set()
-    for name in before.modules.keys() & after.modules.keys():
-        a, b = before.modules[name], after.modules[name]
-        changed.update(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
-    a, b = before.process, after.process
-    changed.update(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
+    pairs = [
+        (before.modules[n], after.modules[n]) for n in before.modules.keys() & after.modules.keys()
+    ]
+    pairs.append((before.process, after.process))
+    for a, b in pairs:
+        for key in a.keys() | b.keys():
+            old, new = a.get(key), b.get(key)
+            if old != new and not any(fnmatch.fnmatchcase(key, p) for p in patterns):
+                changed.add(_changed_key(key, old, new))
     return sorted(changed)
 
 
@@ -316,9 +372,7 @@ class StateSnapshotter:
             elapsed = time.perf_counter() - t0
             if elapsed > SNAPSHOT_BUDGET_S and module.__name__ not in self.cheap:
                 slow[module.__name__] = elapsed
-        process: dict[str, Any] = {
-            f"env:{k}": v for k, v in os.environ.items() if k not in VOLATILE_ENV
-        }
+        process: dict[str, Any] = {f"env:{k}": v for k, v in os.environ.items()}
         process["cwd"] = os.getcwd()
         process["sys.path"] = tuple(sys.path)
         process["logging.root.level"] = logging.root.level
@@ -452,6 +506,7 @@ class ProfilerPlugin:
         self.recorder = FileAccessRecorder()
         self.snapshotter = StateSnapshotter(self.root, ignore_dirs=self._venv_dirs())
         self.state_changes: dict[str, list[str]] = {}
+        self.ignore_state: list[str] = list(config.getini("smartpar_ignore_state"))
 
     @staticmethod
     def _venv_dirs() -> list[Path]:
@@ -489,7 +544,7 @@ class ProfilerPlugin:
         finally:
             self.recorder.current = None
             after = self.snapshotter.take()
-            self.state_changes[item.nodeid] = diff(before, after)
+            self.state_changes[item.nodeid] = diff(before, after, self.ignore_state)
             self.snapshotter.promote_slow(before, after)
 
     def _own_profile(self) -> ProfileData:
