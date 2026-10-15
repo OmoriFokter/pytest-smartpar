@@ -20,20 +20,20 @@ keywords:
 authors:
   - family-names: Paryiskyi
     given-names: Valerii
-  # Placeholders: replace with the co-authors' names before publication.
-  - family-names: "<Прізвище 2>"
-    given-names: "<Ім'я 2>"
-  - family-names: "<Прізвище 3>"
-    given-names: "<Ім'я 3>"
+  - family-names: Kalashnyk
+    given-names: Andrii
+  - family-names: Kulyk
+    given-names: Yevhen
 preferred-citation:
   type: article
   status: in-preparation
   title: "Метод паралельного виконання модульних тестів у системах безперервної інтеграції"
   journal: "АСУ та прилади автоматики"
+  year: 2026
   authors:
     - family-names: Paryiskyi
       given-names: Valerii
-    - family-names: "<Прізвище 2>"
-      given-names: "<Ім'я 2>"
-    - family-names: "<Прізвище 3>"
-      given-names: "<Ім'я 3>"
+    - family-names: Kalashnyk
+      given-names: Andrii
+    - family-names: Kulyk
+      given-names: Yevhen

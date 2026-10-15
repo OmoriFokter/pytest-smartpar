@@ -12,8 +12,8 @@ license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     { name = "Valerii Paryiskyi" },
-    { name = "<Ім'я Прізвище 2>" },
-    { name = "<Ім'я Прізвище 3>" },
+    { name = "Andrii Kalashnyk" },
+    { name = "Yevhen Kulyk" },
 ]
 classifiers = [
     "Framework :: Pytest",

@@ -48,7 +48,7 @@ non-order-dependent), метод лише позначає й виконує о�
 ## Встановлення й швидкий старт
 
 ```
-git clone <репозиторій> pytest-smartpar
+git clone https://github.com/OmoriFokter/pytest-smartpar.git
 cd pytest-smartpar
 python -m pip install -e .            # pytest, pytest-xdist 3.3–3.8, pytest-randomly
 python -m pip install -e ".[bench]"   # лише для експериментального стенду
@@ -425,7 +425,7 @@ fallback (`--dist loadgroup`) і повідомляє про це.
 
 ```bibtex
 @article{smartpar,
-  author  = {Paryiskyi, Valerii and Kalashnyk, Andrii and Yevhen, Kulyk},
+  author  = {Paryiskyi, Valerii and Kalashnyk, Andrii and Kulyk, Yevhen},
   title   = {Метод паралельного виконання модульних тестів у системах безперервної інтеграції},
   journal = {АСУ та прилади автоматики},
   year    = {2026},

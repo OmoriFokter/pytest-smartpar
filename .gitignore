@@ -13,3 +13,6 @@ bench/results/*
 # The final series used in the article is copied here and committed.
 !bench/results/published/
 bench/work/
+
+# Project specification: shared with the co-authors directly, not published.
+SPEC.md
