@@ -522,6 +522,8 @@ class Flaky:
     od_brittle: list[dict[str, Any]] = field(default_factory=list)
     nod: list[dict[str, Any]] = field(default_factory=list)
     unresolved: list[Any] = field(default_factory=list)
+    # How the detection ran: base seed, isolation runs, budget, sandbox, ...
+    detector: dict[str, Any] = field(default_factory=dict)
 
     def order_edges(self) -> list[OrderEdge]:
         """Victim before each of its polluters; each state setter before its brittle test."""
@@ -568,4 +570,5 @@ class Flaky:
             od_brittle=brittle,
             nod=nod,
             unresolved=list(_get(data, "unresolved", list, what)),
+            detector=_get(data, "detector", dict, what) if "detector" in data else {},
         )

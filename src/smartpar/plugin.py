@@ -11,7 +11,9 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -19,8 +21,22 @@ from typing import Any
 import pytest
 
 from smartpar import history as hist_io
+from smartpar.detector import (
+    CONFIRM_RUNS,
+    BudgetExceeded,
+    Detector,
+    ProcessRunner,
+    Sandbox,
+    choose_seeds,
+)
+from smartpar.graph import build as build_graph
 from smartpar.models import FAILED_OUTCOMES, Dependencies, Flaky, History, SchemaError
-from smartpar.profiler import DEFAULT_IGNORE_STATE, ProfilerPlugin, load_dependencies
+from smartpar.profiler import (
+    DEFAULT_IGNORE_STATE,
+    DEPENDENCIES_FILE,
+    ProfilerPlugin,
+    load_dependencies,
+)
 from smartpar.report import (
     ChildReportWriter,
     ProfileRunWriter,
@@ -30,7 +46,14 @@ from smartpar.report import (
     plan_to_dict,
     report_rows,
 )
-from smartpar.scheduler import Analysis, analyze, available_cpus, recommend_workers, worker_name
+from smartpar.scheduler import (
+    Analysis,
+    analyze,
+    available_cpus,
+    estimate_durations,
+    recommend_workers,
+    worker_name,
+)
 from smartpar.xdist_scheduling import (
     REQUIRED_NODE_API,
     FallbackItems,
@@ -67,11 +90,6 @@ RANDOMLY_REORDER_WARNING = (
     "to keep the planned/profiled order; random seeding stays active"
 )
 
-# Mode flag -> implementation phase from SPEC.md. Used to fail loudly instead of
-# silently ignoring a mode that does not work yet.
-_UNIMPLEMENTED_MODES = {
-    "smartpar_detect": ("--smartpar-detect", 6),
-}
 
 PROFILER = pytest.StashKey[ProfilerPlugin]()
 RUN = pytest.StashKey["SmartparRun"]()
@@ -121,6 +139,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         type=float,
         default=None,
         help="Time budget in seconds for --smartpar-detect.",
+    )
+    group.addoption(
+        "--smartpar-detect-workers",
+        type=int,
+        default=None,
+        help="Parallel child runs for --smartpar-detect, each in its own project copy "
+        "(default: available CPUs).",
     )
     group.addoption(
         "--smartpar-fallback",
@@ -192,12 +217,6 @@ def pytest_configure(config: pytest.Config) -> None:
     if config.stash[RANDOMLY_REORDER_DISABLED] and is_controller and terminal is not None:
         terminal.write_line(RANDOMLY_REORDER_WARNING, yellow=True)
 
-    for dest, (flag, phase) in _UNIMPLEMENTED_MODES.items():
-        if config.getoption(dest):
-            raise pytest.UsageError(
-                f"smartpar: {flag} is not implemented yet (planned in phase {phase})."
-            )
-
     if config.getoption("smartpar_child_report"):
         collector = RunCollector("child", 1, config.stash[RANDOMLY_REORDER_DISABLED])
         config.pluginmanager.register(collector, "smartpar-run-collector")
@@ -209,6 +228,14 @@ def pytest_configure(config: pytest.Config) -> None:
         _start_profiling(config)
     elif config.getoption("smartpar"):
         _start_smartpar(config)
+    elif config.getoption("smartpar_detect"):
+        if is_xdist_controller(config):
+            raise pytest.UsageError(
+                "smartpar: --smartpar-detect runs its own child processes; do not use -n"
+            )
+        config.pluginmanager.register(
+            DetectSession(config, _smartpar_dir(config)), "smartpar-detect"
+        )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -659,3 +686,106 @@ class SmartparRun:
         terminalreporter.write_sep("-", f"smartpar ({self.mode})")
         for line in lines:
             terminalreporter.write_line(line)
+
+
+# --- --smartpar-detect ------------------------------------------------------------------
+
+
+class DetectSession:
+    """Collects the tests, then runs the detector instead of the tests."""
+
+    def __init__(self, config: pytest.Config, smartpar_dir: Path) -> None:
+        self.config = config
+        self.smartpar_dir = smartpar_dir
+        self.flaky: Flaky | None = None
+        self.meta: dict[str, Any] = {}
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtestloop(self, session: pytest.Session) -> bool:
+        if session.testsfailed and not self.config.option.continue_on_collection_errors:
+            raise session.Interrupted("smartpar: collection errors, detection not started")
+        nodeids = [item.nodeid for item in session.items]
+        self.flaky, self.meta = run_detection(self.config, self.smartpar_dir, nodeids)
+        return True  # the tests themselves ran in child processes
+
+    def pytest_terminal_summary(self, terminalreporter: Any) -> None:
+        if self.flaky is None:
+            return
+        f, m = self.flaky, self.meta
+        terminalreporter.write_sep("-", "smartpar detect")
+        terminalreporter.write_line(
+            f"{f.runs} random runs (seeds {f.seeds[0]}..{f.seeds[-1]}), "
+            f"{m['child_runs']} child runs, {m['sandbox']}, {m['elapsed_s']:.1f}s"
+        )
+        terminalreporter.write_line(
+            f"victims: {len(f.od_victims)}, brittle: {len(f.od_brittle)}, "
+            f"NOD: {len(f.nod)}, unresolved: {len(f.unresolved)}"
+        )
+        for v in f.od_victims:
+            terminalreporter.write_line(f"  {v['victim']} <- {', '.join(v['polluters'])}")
+        for b in f.od_brittle:
+            terminalreporter.write_line(f"  {b['test']} needs {', '.join(b['state_setters'])}")
+        terminalreporter.write_line(f"written: {self.smartpar_dir / hist_io.FLAKY_FILE}")
+
+
+def run_detection(
+    config: pytest.Config, smartpar_dir: Path, nodeids: list[str]
+) -> tuple[Flaky, dict[str, Any]]:
+    """Detector over ``nodeids``; writes flaky.json and updates dependencies.json."""
+    t0 = time.monotonic()
+    runs = config.getoption("smartpar_runs")
+    base_seed, seeds = choose_seeds(config.getoption("smartpar_seed"), runs)
+    budget = config.getoption("smartpar_detect_budget")
+    root = Path(config.rootpath)
+    sandbox = Sandbox(root, extra_ignore=[smartpar_dir, Path(sys.prefix)])
+    runner = ProcessRunner(
+        root=root,
+        nodeids=nodeids,
+        sandbox=sandbox,
+        inipath=Path(config.inipath) if config.inipath else None,
+        workers=config.getoption("smartpar_detect_workers") or available_cpus(),
+        deadline=None if budget is None else t0 + budget,
+    )
+    deps = load_dependencies(smartpar_dir)
+    detector = Detector(runner, deps.state_changes if deps else {})
+    try:
+        try:
+            flaky = detector.detect(seeds)
+        except BudgetExceeded:  # during the random runs themselves
+            flaky = Flaky(runs=0, seeds=seeds, unresolved=[{"test": "*", "reason": "budget"}])
+    finally:
+        sandbox.cleanup()
+    meta = {
+        "base_seed": base_seed,
+        "isolation_runs": detector.k,
+        "confirm_runs": CONFIRM_RUNS,
+        "budget_s": budget,
+        "elapsed_s": time.monotonic() - t0,
+        "child_runs": runner.child_runs,
+        "parallel_runs": runner.workers,
+        "sandbox": "sequential in the project directory"
+        if sandbox.in_place
+        else "a fresh project copy per run",
+    }
+    flaky.detector = meta
+    hist_io.atomic_write_json(smartpar_dir / hist_io.FLAKY_FILE, flaky.to_dict())
+    _update_dependencies(smartpar_dir, flaky, nodeids)
+    return flaky, meta
+
+
+def _update_dependencies(smartpar_dir: Path, flaky: Flaky, nodeids: list[str]) -> None:
+    """Mirror the confirmed pairs into dependencies.json and rebuild groups."""
+    deps = load_dependencies(smartpar_dir) or Dependencies()
+    hist = hist_io.load_history(smartpar_dir)
+    tests = set(nodeids) | set(deps.file_access) | set(deps.state_changes)
+    durations = estimate_durations(tests, hist).durations
+    graph = build_graph(
+        tests,
+        deps.file_access,
+        flaky.order_edges(),
+        durations,
+        isolate=flaky.nod_tests(),
+        collection_index=deps.collection_index or {n: i for i, n in enumerate(nodeids)},
+    )
+    deps.conflicts, deps.order_edges, deps.groups = graph.conflicts, graph.order_edges, graph.groups
+    hist_io.atomic_write_json(smartpar_dir / DEPENDENCIES_FILE, deps.to_dict())

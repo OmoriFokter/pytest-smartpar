@@ -44,14 +44,6 @@ def test_plugin_is_inactive_without_flags(pytester: pytest.Pytester) -> None:
     result.assert_outcomes(passed=1)
 
 
-@pytest.mark.parametrize("flag", ["--smartpar-detect"])
-def test_unimplemented_mode_fails_loudly(pytester: pytest.Pytester, flag: str) -> None:
-    pytester.makepyfile("def test_ok(): pass")
-    result = pytester.runpytest(flag)
-    assert result.ret == pytest.ExitCode.USAGE_ERROR
-    result.stderr.fnmatch_lines(["*not implemented yet*"])
-
-
 def test_console_script_installed() -> None:
     exe = shutil.which("smartpar", path=str(Path(sys.executable).parent))
     assert exe is not None
