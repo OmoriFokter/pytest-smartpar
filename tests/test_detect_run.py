@@ -174,3 +174,31 @@ def test_detect_rejects_xdist(pytester: pytest.Pytester) -> None:
     result = pytester.runpytest_subprocess("--smartpar-detect", "-n", "2")
     assert result.ret == pytest.ExitCode.USAGE_ERROR
     result.stderr.fnmatch_lines(["*--smartpar-detect runs its own child processes*"])
+
+
+RANDOM_NOD = """
+import random
+
+def test_coin():
+    # Plain random: pytest-randomly re-seeds it before every test. Isolated
+    # runs must use different seeds, otherwise all of them would be identical.
+    assert random.random() < 0.5
+"""
+
+
+def test_nod_on_plain_random_is_detected_with_distinct_isolation_seeds(
+    pytester: pytest.Pytester,
+) -> None:
+    pytester.makepyfile(test_coin=RANDOM_NOD)
+    pytester.makeini("[pytest]\nsmartpar_max_pair_checks = 4\nsmartpar_max_orders_per_victim = 2\n")
+    result = pytester.runpytest_subprocess(
+        "--smartpar-detect", "--smartpar-seed", "500", "--smartpar-runs", "10", timeout=TIMEOUT
+    )
+    assert result.ret == 0
+    flaky = json.loads((pytester.path / ".smartpar" / "flaky.json").read_text())
+    assert [n["test"] for n in flaky["nod"]] == ["test_coin.py::test_coin"]
+    meta = flaky["detector"]
+    assert meta["limits"] == {"max_pair_checks": 4, "max_orders_per_victim": 2}
+    assert meta["truncated_victims"] == 0
+    assert meta["ordered_seed_start"] == 510  # right after the random-run seeds
+    assert meta["ordered_runs"] >= 3

@@ -92,6 +92,9 @@ class FakeSuite:
             results.append(self._run(list(order)))
         return results
 
+    def confirm_runs(self, orders: Sequence[Sequence[str]]) -> list[RunResult]:
+        return self.ordered_runs(orders)
+
 
 TESTS = [f"t{i:02d}" for i in range(12)]
 
@@ -179,9 +182,10 @@ def test_unconfirmed_candidate_is_not_reported() -> None:
 
         def ordered_runs(self, orders):  # type: ignore[override]
             results = super().ordered_runs(orders)
-            if len(orders) == 2 * detector.CONFIRM_RUNS:
-                return [RunResult({o[-1]: "passed"}, list(o), 0) for o in orders]
             return results
+
+        def confirm_runs(self, orders):  # type: ignore[override]
+            return [RunResult({o[-1]: "passed"}, list(o), 0) for o in orders]
 
     suite = Flipping([*TESTS, "polluter", "victim"], victims={"victim": ["polluter"]})
     flaky = detect(suite, {"polluter": ["m.X"]})
@@ -312,3 +316,59 @@ def test_child_imports_come_from_the_copy(tmp_path: Path, monkeypatch: pytest.Mo
     assert parts[0] == str(copy / "src")
     assert str(root / "src") not in parts
     assert parts[-1] == "/elsewhere"
+
+
+def test_ordered_runs_get_distinct_reproducible_randomly_seeds(tmp_path: Path) -> None:
+    sandbox = Sandbox(tmp_path)
+    try:
+        runner = ProcessRunner(tmp_path, [], sandbox, None, workers=4, ordered_seed_start=120)
+        first = runner._ordered_opts(3)
+        second = runner._ordered_opts(2)
+    finally:
+        sandbox.cleanup()
+    seeds = [o[2] for o in first + second]
+    assert seeds == [f"--randomly-seed={s}" for s in range(120, 125)]  # all different
+    assert all(
+        o[:2] == ["-p", "randomly"] and o[3] == "--randomly-dont-reorganize" for o in first + second
+    )
+    assert runner.ordered_seeds_used == 5
+
+
+@pytest.mark.parametrize(("workers", "expected"), [(8, 4), (3, 1), (1, 1)])
+def test_confirmation_uses_at_most_half_the_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int, expected: int
+) -> None:
+    sandbox = Sandbox(tmp_path)
+    used: list[int] = []
+
+    def fake_map(opts, orders, workers=None):  # type: ignore[no-untyped-def]
+        used.append(workers)
+        return []
+
+    try:
+        runner = ProcessRunner(tmp_path, [], sandbox, None, workers=workers)
+        monkeypatch.setattr(runner, "_map", fake_map)
+        runner.confirm_runs([["a", "b"], ["b"]])
+    finally:
+        sandbox.cleanup()
+    assert used == [expected]
+
+
+def test_limits_are_applied_and_truncation_reported() -> None:
+    suite = FakeSuite([*TESTS, "victim"], victims={"victim": ["t09"]})
+    state = {t: ["m.X"] for t in TESTS}  # every test is a pair candidate
+    det = Detector(suite, state, max_pair_checks=2, max_orders=1)
+    flaky = det.detect(list(range(100, 120)))
+    assert flaky.od_victims[0]["polluters"] == ["t09"]  # ddmin still finds it
+    pair_checks = [o for o in suite.ordered_log if len(o) == 2 and o[1] == "victim"]
+    assert len({tuple(o) for o in pair_checks} - {("t09", "victim")}) <= 2
+    assert det.truncated_report() == [{"test": "victim", "limits": ["max_pair_checks"]}]
+
+
+def test_max_orders_truncation() -> None:
+    # Two independent polluters: with max_orders=1 the second may stay unexplored.
+    suite = FakeSuite([*TESTS, "victim"], victims={"victim": ["t02", "t08"]})
+    det = Detector(suite, {}, max_orders=1)
+    flaky = det.detect(list(range(100, 140)))
+    assert len(flaky.od_victims[0]["polluters"]) == 1
+    assert det.truncated_report() == [{"test": "victim", "limits": ["max_orders_per_victim"]}]

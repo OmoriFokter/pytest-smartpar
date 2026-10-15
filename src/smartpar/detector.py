@@ -2,6 +2,8 @@
 
 1. The suite runs ``runs`` times in random orders (pytest-randomly, seeds
    ``base_seed + i``), every run a fresh ``python -m pytest`` process.
+   Runs in a given order keep pytest-randomly's re-seeding with their own
+   seeds (``base_seed + runs + j``), so repeated isolated runs differ.
 2. Every test that failed at least once is run alone ``k`` times:
 
    * fails alone sometimes, but not always - NOD (not order-dependent);
@@ -49,6 +51,7 @@ log = logging.getLogger("smartpar.detector")
 ISOLATION_RUNS = 3  # k: runs of a failing test alone
 EXTRA_ISOLATION_RUNS = 5  # before declaring a victim without polluter unresolved
 CONFIRM_RUNS = 2  # each half of a confirmation ([P, V] and [V])
+# Defaults of the ini options smartpar_max_pair_checks / smartpar_max_orders_per_victim.
 MAX_PAIR_CHECKS = 10  # direct [P, V] checks before delta debugging
 MAX_ORDERS_PER_TEST = 3  # failing (passing) orders examined per victim (brittle)
 CACHE_GROWTH = "cache_growth:"
@@ -95,6 +98,10 @@ class Runner(Protocol):
     def random_runs(self, seeds: Sequence[int]) -> list[RunResult]: ...
 
     def ordered_runs(self, orders: Sequence[Sequence[str]]) -> list[RunResult]: ...
+
+    def confirm_runs(self, orders: Sequence[Sequence[str]]) -> list[RunResult]:
+        """Like ordered_runs, but with less parallelism (timing-sensitive tests)."""
+        ...
 
 
 # --- delta debugging ------------------------------------------------------------------
@@ -161,10 +168,16 @@ class Detector:
         runner: Runner,
         state_changes: dict[str, list[str]],
         isolation_runs: int = ISOLATION_RUNS,
+        max_pair_checks: int = MAX_PAIR_CHECKS,
+        max_orders: int = MAX_ORDERS_PER_TEST,
     ) -> None:
         self.runner = runner
         self.state_changes = state_changes
         self.k = isolation_runs
+        self.max_pair_checks = max_pair_checks
+        self.max_orders = max_orders
+        # Tests whose search hit a limit: nodeid -> names of the limits.
+        self.truncated: dict[str, set[str]] = {}
         self._cache: dict[tuple[str, ...], RunResult] = {}
 
     # Ordered runs are deterministic for order-dependent tests, so results
@@ -223,10 +236,8 @@ class Detector:
         polluters: list[str] = []
         examples: list[list[str]] = []
         orders = [r.order for r in runs if r.failed(v) and v in r.order]
-        for order in orders[:MAX_ORDERS_PER_TEST]:
+        for order in self._limited_orders(v, orders, lambda prefix: polluters):
             prefix = order[: order.index(v)]
-            if any(p in prefix for p in polluters):
-                continue
             culprits = self._search(prefix, v, lambda r: r.failed(v))
             if culprits and self._confirm(culprits, v, victim=True):
                 polluters.extend(c for c in culprits if c not in polluters)
@@ -254,10 +265,8 @@ class Detector:
         setters: list[str] = []
         examples: list[list[str]] = []
         orders = [r.order for r in runs if r.passed(b) and b in r.order]
-        for order in orders[:MAX_ORDERS_PER_TEST]:
+        for order in self._limited_orders(b, orders, lambda prefix: setters):
             prefix = order[: order.index(b)]
-            if any(s in prefix for s in setters):
-                continue
             culprits = self._search(prefix, b, lambda r: r.passed(b))
             if culprits and self._confirm(culprits, b, victim=False):
                 setters.extend(c for c in culprits if c not in setters)
@@ -275,13 +284,31 @@ class Detector:
         else:
             flaky.unresolved.append({"test": b, "reason": "no confirmed state setter found"})
 
+    def _limited_orders(
+        self, target: str, orders: list[list[str]], found: Callable[[list[str]], list[str]]
+    ) -> Iterable[list[str]]:
+        """Orders not explained by culprits found so far, at most ``max_orders``."""
+        examined = 0
+        for order in orders:
+            prefix = order[: order.index(target)]
+            if any(c in prefix for c in found(prefix)):
+                continue
+            if examined == self.max_orders:
+                self.truncated.setdefault(target, set()).add("max_orders_per_victim")
+                return
+            examined += 1
+            yield order
+
     def _search(
         self, prefix: list[str], target: str, holds: Callable[[RunResult], bool]
     ) -> list[str] | None:
         """Minimal tests from ``prefix`` that, run before ``target``, make ``holds`` true."""
         if not prefix or not holds(self._ordered([*prefix, target])):
             return None  # the suite order does not reproduce it
-        for candidate in pair_candidates(prefix, self.state_changes):
+        candidates = pair_candidates(prefix, self.state_changes, limit=len(prefix))
+        if len(candidates) > self.max_pair_checks:
+            self.truncated.setdefault(target, set()).add("max_pair_checks")
+        for candidate in candidates[: self.max_pair_checks]:
             if holds(self._ordered([candidate, target])):
                 return [candidate]
         return ddmin(prefix, lambda subset: holds(self._ordered([*subset, target])))
@@ -289,11 +316,14 @@ class Detector:
     def _confirm(self, culprits: list[str], target: str, victim: bool) -> bool:
         """Fresh processes: with the culprits the outcome flips, alone it does not."""
         orders = [[*culprits, target]] * CONFIRM_RUNS + [[target]] * CONFIRM_RUNS
-        results = self.runner.ordered_runs(orders)
+        results = self.runner.confirm_runs(orders)
         with_c, alone = results[:CONFIRM_RUNS], results[CONFIRM_RUNS:]
         if victim:
             return all(r.failed(target) for r in with_c) and all(r.passed(target) for r in alone)
         return all(r.passed(target) for r in with_c) and all(r.failed(target) for r in alone)
+
+    def truncated_report(self) -> list[dict[str, Any]]:
+        return [{"test": t, "limits": sorted(v)} for t, v in sorted(self.truncated.items())]
 
     def _hint(self, tests: Iterable[str]) -> list[str]:
         return sorted({k for t in tests for k in self.state_changes.get(t, [])})
@@ -345,6 +375,12 @@ class ProcessRunner:
     inipath: Path | None
     workers: int
     deadline: float | None = None
+    # Ordered runs keep pytest-randomly active (it re-seeds random & co. before
+    # every test) with --randomly-dont-reorganize, each run with its own seed
+    # ordered_seed_start, +1, ... in call order: isolated runs of a NOD test
+    # differ, yet every run is reproducible.
+    ordered_seed_start: int = 0
+    ordered_seeds_used: int = 0
     child_runs: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -356,15 +392,38 @@ class ProcessRunner:
         return self._map([["-p", "randomly", f"--randomly-seed={s}"] for s in seeds], None)
 
     def ordered_runs(self, orders: Sequence[Sequence[str]]) -> list[RunResult]:
-        return self._map([["-p", "no:randomly"] for _ in orders], [list(o) for o in orders])
+        return self._map(self._ordered_opts(len(orders)), [list(o) for o in orders])
 
-    def _map(self, opts: list[list[str]], orders: list[list[str]] | None) -> list[RunResult]:
+    def confirm_runs(self, orders: Sequence[Sequence[str]]) -> list[RunResult]:
+        """At most half the workers: CPU load must not fail timing-sensitive tests."""
+        return self._map(
+            self._ordered_opts(len(orders)),
+            [list(o) for o in orders],
+            workers=max(1, self.workers // 2),
+        )
+
+    def _ordered_opts(self, n: int) -> list[list[str]]:
+        with self._lock:
+            first = self.ordered_seed_start + self.ordered_seeds_used
+            self.ordered_seeds_used += n
+        return [
+            ["-p", "randomly", f"--randomly-seed={first + i}", "--randomly-dont-reorganize"]
+            for i in range(n)
+        ]
+
+    def _map(
+        self,
+        opts: list[list[str]],
+        orders: list[list[str]] | None,
+        workers: int | None = None,
+    ) -> list[RunResult]:
         jobs = list(zip(opts, orders or [self.nodeids] * len(opts), strict=True))
+        workers = min(self.workers, workers or self.workers)
         if not jobs:
             return []
-        if self.workers <= 1 or len(jobs) == 1:
+        if workers <= 1 or len(jobs) == 1:
             return [self._run(o, ids) for o, ids in jobs]
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(lambda job: self._run(*job), jobs))
 
     def _run(self, opts: list[str], nodeids: list[str]) -> RunResult:

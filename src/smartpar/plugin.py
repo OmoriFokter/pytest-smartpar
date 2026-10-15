@@ -23,6 +23,8 @@ import pytest
 from smartpar import history as hist_io
 from smartpar.detector import (
     CONFIRM_RUNS,
+    MAX_ORDERS_PER_TEST,
+    MAX_PAIR_CHECKS,
     BudgetExceeded,
     Detector,
     ProcessRunner,
@@ -96,6 +98,18 @@ RUN = pytest.StashKey["SmartparRun"]()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addini(
+        "smartpar_max_pair_checks",
+        type="string",
+        default=str(MAX_PAIR_CHECKS),
+        help="--smartpar-detect: direct [P, V] checks per search before delta debugging",
+    )
+    parser.addini(
+        "smartpar_max_orders_per_victim",
+        type="string",
+        default=str(MAX_ORDERS_PER_TEST),
+        help="--smartpar-detect: failing (passing) orders examined per victim (brittle test)",
+    )
     parser.addini(
         "smartpar_ignore_state",
         type="linelist",
@@ -745,9 +759,19 @@ def run_detection(
         inipath=Path(config.inipath) if config.inipath else None,
         workers=config.getoption("smartpar_detect_workers") or available_cpus(),
         deadline=None if budget is None else t0 + budget,
+        ordered_seed_start=seeds[-1] + 1,
     )
+    limits = {
+        "max_pair_checks": _ini_int(config, "smartpar_max_pair_checks"),
+        "max_orders_per_victim": _ini_int(config, "smartpar_max_orders_per_victim"),
+    }
     deps = load_dependencies(smartpar_dir)
-    detector = Detector(runner, deps.state_changes if deps else {})
+    detector = Detector(
+        runner,
+        deps.state_changes if deps else {},
+        max_pair_checks=limits["max_pair_checks"],
+        max_orders=limits["max_orders_per_victim"],
+    )
     try:
         try:
             flaky = detector.detect(seeds)
@@ -758,6 +782,12 @@ def run_detection(
     meta = {
         "base_seed": base_seed,
         "isolation_runs": detector.k,
+        "limits": limits,
+        "truncated_victims": len(detector.truncated),
+        "truncated": detector.truncated_report(),
+        "ordered_seed_start": runner.ordered_seed_start,
+        "ordered_runs": runner.ordered_seeds_used,
+        "confirm_parallel_runs": max(1, runner.workers // 2),
         "confirm_runs": CONFIRM_RUNS,
         "budget_s": budget,
         "elapsed_s": time.monotonic() - t0,
@@ -771,6 +801,17 @@ def run_detection(
     hist_io.atomic_write_json(smartpar_dir / hist_io.FLAKY_FILE, flaky.to_dict())
     _update_dependencies(smartpar_dir, flaky, nodeids)
     return flaky, meta
+
+
+def _ini_int(config: pytest.Config, name: str) -> int:
+    raw = config.getini(name)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise pytest.UsageError(f"smartpar: ini option {name} must be an integer") from exc
+    if value < 0:
+        raise pytest.UsageError(f"smartpar: ini option {name} must be >= 0")
+    return value
 
 
 def _update_dependencies(smartpar_dir: Path, flaky: Flaky, nodeids: list[str]) -> None:
