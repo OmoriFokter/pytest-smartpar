@@ -7,6 +7,11 @@
 # survey has to confirm (number of tests, failures "out of the box",
 # network-dependent tests to deselect). Placeholders: {python} - the
 # project's virtualenv interpreter.
+# One interpreter version for every project of a series, so that results are
+# comparable. 3.12: pydantic-core 2.23.4 (Pydantic v2.9.2) has no build for
+# 3.14. A project may override it with its own `python:`.
+python: "3.12"
+
 projects:
   - name: control_project
     # Inside this repository: copied into the workspace and committed there

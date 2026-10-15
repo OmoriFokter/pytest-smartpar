@@ -129,6 +129,39 @@ def test_projects_yaml_pins_every_git_project() -> None:
             assert len(p.sha) == 40 and all(c in "0123456789abcdef" for c in p.sha)
 
 
+def test_projects_share_one_python_version_unless_overridden(tmp_path: Path) -> None:
+    projects = setup_projects.load_projects()
+    assert {p.python for p in projects} == {"3.12"}
+    path = tmp_path / "p.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "python": "3.11",
+                "projects": [
+                    {
+                        "name": "a",
+                        "local": "x",
+                        "tests": "t",
+                        "install": [],
+                        "pytest_args": [],
+                        "deselect": [],
+                    },
+                    {
+                        "name": "b",
+                        "local": "x",
+                        "tests": "t",
+                        "install": [],
+                        "pytest_args": [],
+                        "deselect": [],
+                        "python": "3.13",
+                    },
+                ],
+            }
+        )
+    )
+    assert [p.python for p in setup_projects.load_projects(path)] == ["3.11", "3.13"]
+
+
 def test_load_projects_rejects_missing_sha(tmp_path: Path) -> None:
     path = tmp_path / "p.yaml"
     path.write_text(

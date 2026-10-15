@@ -56,6 +56,9 @@ class Project:
     local: str | None = None
     ground_truth: str | None = None
     status: str = "selected"
+    # Interpreter version of the project's venv, e.g. "3.12" (from the
+    # top-level `python` of projects.yaml unless overridden per project).
+    python: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def paths(self, work: Path) -> tuple[Path, Path]:
@@ -65,9 +68,10 @@ class Project:
 
 def load_projects(path: Path = DEFAULT_PROJECTS) -> list[Project]:
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    default_python = data.get("python")
     projects = []
     for entry in data["projects"]:
-        entry = dict(entry)
+        entry = {"python": default_python, **entry}
         known = {k: entry.pop(k) for k in list(entry) if k in Project.__dataclass_fields__}
         project = Project(**known, extra=entry)
         if project.local is None and (
@@ -161,11 +165,33 @@ def installer() -> list[str] | None:
     return [uv, "pip", "install", "--python"] if uv else None
 
 
+def python_version(python: Path) -> str:
+    """'3.12' for the given interpreter."""
+    code = "import sys; print('%d.%d' % sys.version_info[:2])"
+    return run([str(python), "-c", code], capture_output=True).stdout.strip()
+
+
+def create_venv(venv: Path, version: str | None) -> None:
+    """A venv with the requested Python (uv can download it); else this interpreter."""
+    uv = shutil.which("uv")
+    if version is None:
+        run([sys.executable, "-m", "venv", str(venv)])
+    elif uv:
+        run([uv, "venv", "-q", "--python", version, str(venv)])
+    elif interpreter := shutil.which(f"python{version}"):
+        run([interpreter, "-m", "venv", str(venv)])
+    else:
+        raise RuntimeError(f"Python {version} not found: install it or uv (it can fetch it)")
+
+
 def setup_venv(project: Project, work: Path) -> Path:
     src, venv = project.paths(work)
     python = venv_python(venv)
+    if python.exists() and project.python and python_version(python) != project.python:
+        print(f"   venv has Python {python_version(python)}, need {project.python}: recreating")
+        shutil.rmtree(venv)
     if not python.exists():
-        run([sys.executable, "-m", "venv", str(venv)])
+        create_venv(venv, project.python)
     for command in project.install:
         cmd = command.format(python=python).split()
         uv = installer()
@@ -310,20 +336,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--survey", action="store_true", help="one serial run per project")
     args = parser.parse_args(argv)
     projects = select(load_projects(args.projects), args.only)
-    results = []
+    results: list[dict[str, Any]] = []
+    out = REPO_ROOT / "bench" / "results" / f"survey_{datetime.now():%Y%m%d_%H%M%S}.json"
+    failed = []
     for project in projects:
         print(f"== {project.name}")
-        sha = prepare_source(project, args.work)
-        python = setup_venv(project, args.work)
-        print(f"   at {sha}; {versions(python)}")
+        try:
+            sha = prepare_source(project, args.work)
+            python = setup_venv(project, args.work)
+            print(f"   at {sha}; {versions(python)}")
+            if args.survey:
+                r = survey(project, args.work)
+                print(f"   {r['tests']} tests, {r['wall_s']} s, {r['failures']} failures")
+        except (subprocess.CalledProcessError, RuntimeError, OSError) as exc:
+            # One broken project must not lose the others' results.
+            failed.append(project.name)
+            r = {"project": project.name, "error": str(exc)}
+            print(f"   FAILED: {exc}")
         if args.survey:
-            results.append(survey(project, args.work))
-            r = results[-1]
-            print(f"   {r['tests']} tests, {r['wall_s']} s, {r['failures']} failures")
+            results.append(r)
+            # Written after every project, so an interruption keeps what is done.
+            out.write_text(json.dumps({"machine": machine_info(), "projects": results}, indent=2))
     if args.survey:
-        out = REPO_ROOT / "bench" / "results" / f"survey_{datetime.now():%Y%m%d_%H%M%S}.json"
-        out.write_text(json.dumps({"machine": machine_info(), "projects": results}, indent=2))
         print(f"survey written to {out}")
+    if failed:
+        print(f"set-up failed for: {', '.join(failed)}")
+        return 1
     return 0
 
 
