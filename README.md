@@ -425,11 +425,13 @@ fallback (`--dist loadgroup`) і повідомляє про це.
 
 ```bibtex
 @article{smartpar,
-  author  = {Paryiskyi, Valerii and <Прізвище 2>, <Ім'я 2> and <Прізвище 3>, <Ім'я 3>},
+  author  = {Paryiskyi, Valerii and Kalashnyk, Andrii and Yevhen, Kulyk},
   title   = {Метод паралельного виконання модульних тестів у системах безперервної інтеграції},
   journal = {АСУ та прилади автоматики},
-  year    = {<рік>},
+  year    = {2026},
+  version = {0.1.0},
   note    = {Програмна реалізація: pytest-smartpar}
+  url     = {https://github.com/OmoriFokter/pytest-smartpar}
 }
 ```
 
