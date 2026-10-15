@@ -15,14 +15,6 @@ def many_tests(pytester: pytest.Pytester) -> None:
     pytester.makepyfile("\n".join(f"def {name}(): pass" for name in SOURCE_ORDER))
 
 
-@pytest.fixture
-def modes_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The modes themselves arrive in later phases; until then they abort in
-    # pytest_configure. Lift that guard so the policy can be observed in a real
-    # in-process session.
-    monkeypatch.setattr(plugin, "_UNIMPLEMENTED_MODES", {})
-
-
 def run_order(pytester: pytest.Pytester, *args: str) -> list[str]:
     reprec = pytester.inline_run("-p", "randomly", "-p", "no:cacheprovider", *args)
     reports = reprec.getreports("pytest_runtest_logreport")
@@ -58,9 +50,9 @@ def test_randomly_shuffles_without_smartpar(pytester: pytest.Pytester, many_test
     assert run_order(pytester, "--randomly-seed=12345") != SOURCE_ORDER
 
 
-@pytest.mark.parametrize("flag", ["--smartpar", "--smartpar-profile"])
+@pytest.mark.parametrize("flag", ["--smartpar-profile"])  # --smartpar: see test_smartpar_run
 def test_order_kept_and_warning_printed(
-    pytester: pytest.Pytester, many_tests: None, modes_enabled: None, flag: str
+    pytester: pytest.Pytester, many_tests: None, flag: str
 ) -> None:
     assert run_order(pytester, flag, "--randomly-seed=12345") == SOURCE_ORDER
 

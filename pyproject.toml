@@ -22,9 +22,10 @@ classifiers = [
 ]
 dependencies = [
     "pytest>=8",
-    # The scheduler interface of xdist is internal. The upper bound is pinned to the
-    # versions that are covered by tests (see tests for xdist_scheduling, phase 5).
-    "pytest-xdist>=3.6,<3.9",
+    # smartpar implements xdist's internal scheduler interface. Only versions
+    # whose behaviour is covered by the test suite are allowed (CI job
+    # "xdist-compat"); keep in sync with plugin.SUPPORTED_XDIST.
+    "pytest-xdist>=3.3,<3.9",
     "pytest-randomly>=3.15",
 ]
 

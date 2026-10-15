@@ -72,9 +72,14 @@ def _write_temp(directory: Path, name: str, payload: bytes) -> Path:
 
 def atomic_write_json(path: Path, data: Any) -> None:
     """Replace ``path`` with ``data`` atomically."""
+    # Serialize first: a TypeError must not leave a temp file.
+    atomic_write_bytes(path, _dump(data))
+
+
+def atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Replace ``path`` with ``payload`` atomically."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = _dump(data)  # serialize first: a TypeError must not leave a temp file
     tmp = _write_temp(path.parent, path.name, payload)
     try:
         os.replace(tmp, path)

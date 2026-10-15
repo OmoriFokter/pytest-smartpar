@@ -251,6 +251,13 @@ class RunRecord:
     # Measured parallel overhead of this run (wall time not explained by
     # test durations), if known; calibrates the Overhead model.
     overhead_s: float | None = None
+    # Prediction of the plan for this run (predicted_makespan_s), if any.
+    predicted_wall_s: float | None = None
+    # How the isolated tail ran: "barrier", "separate-pass" or "none".
+    tail_mode: str = "none"
+    # New tests that failed and were re-run alone in a child process:
+    # {"nodeid", "first_outcome", "rerun_outcome", "duration", "suspected_dependency"}.
+    reruns: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -281,6 +288,13 @@ class RunRecord:
             tests=[TestRecord.from_dict(t, f"{what} test #{i}") for i, t in enumerate(tests)],
             randomly_reorder_disabled=_get(data, "randomly_reorder_disabled", bool, what),
             overhead_s=overhead,
+            predicted_wall_s=(
+                None
+                if data.get("predicted_wall_s") is None
+                else _number(data["predicted_wall_s"], f"{what}: predicted_wall_s")
+            ),
+            tail_mode=data.get("tail_mode", "none"),
+            reruns=_obj_list(data.get("reruns", []), f"{what}: reruns"),
         )
 
 
