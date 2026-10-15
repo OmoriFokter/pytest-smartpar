@@ -191,6 +191,8 @@ def apply_run(history: History, run: RunRecord, alpha: float) -> None:
         samples[run.workers] = (
             run.overhead_s if prev is None else alpha * run.overhead_s + (1 - alpha) * prev
         )
+        counts = history.overhead.counts
+        counts[run.workers] = counts.get(run.workers, 0) + 1
         history.overhead.refit()
 
 

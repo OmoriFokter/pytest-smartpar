@@ -167,6 +167,7 @@ def plan_to_dict(
         "predicted_lpt_makespan_s": plan.lpt_makespan_s,
         "predicted_tail_s": plan.tail_s,
         "predicted_overhead_s": plan.overhead_s,
+        "overhead_model": analysis.overhead_model,
         "predicted_curve": {str(m): t for m, t in analysis.curve.items()},
         "assignments": {
             wid: [[u.id, list(u.tests)] for u in plan.assignments[worker_name(i)]]
@@ -197,6 +198,8 @@ REPORT_COLUMNS = [
     "worker_idle_s",
     "worker_tests",
     "failures",
+    "failures_before_rerun",
+    "failures_after_rerun",
     "reruns",
     "suspected_dependency",
     "tail_mode",
@@ -214,6 +217,8 @@ def report_rows(run: RunRecord, history_before: History) -> list[dict[str, str]]
 
     ``failures`` per worker counts first attempts; on the ALL row it counts
     final failures (a new test that passed on its re-run is not one).
+    ``failures_before_rerun`` / ``failures_after_rerun`` are run totals on
+    every row (for comparisons with plain xdist, which has no re-runs).
     ``speedup_vs_history_serial`` = sum of history EMAs of the run's tests
     (known ones) / wall time.
     """
@@ -235,6 +240,8 @@ def report_rows(run: RunRecord, history_before: History) -> list[dict[str, str]]
         "prediction_error_pct": _fmt(error, 2),
         "sum_test_time_s": _fmt(sum(t.duration for t in run.tests)),
         "speedup_vs_history_serial": _fmt(serial / wall if serial and wall else None, 3),
+        "failures_before_rerun": str(run.failures_before_rerun),
+        "failures_after_rerun": str(run.failures_after_rerun),
         "reruns": str(len(run.reruns)),
         "suspected_dependency": str(suspected),
         "tail_mode": run.tail_mode,

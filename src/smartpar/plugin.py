@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from smartpar import history as hist_io
-from smartpar.models import FAILED_OUTCOMES, Dependencies, Flaky, History, SchemaError, TestRecord
+from smartpar.models import FAILED_OUTCOMES, Dependencies, Flaky, History, SchemaError
 from smartpar.profiler import DEFAULT_IGNORE_STATE, ProfilerPlugin, load_dependencies
 from smartpar.report import (
     ChildReportWriter,
@@ -54,6 +54,9 @@ SUPPORTED_XDIST = ((3, 3), (3, 9))  # [min, max)
 MODE_SMARTPAR = "smartpar"
 MODE_FALLBACK = "smartpar-fallback"
 MODE_BOOTSTRAP = "smartpar-bootstrap"
+# Modes executed by SmartparScheduling (bootstrap: no durations yet, every
+# test estimated equally, so a group's estimate is its number of tests).
+SCHEDULED_MODES = frozenset({MODE_SMARTPAR, MODE_BOOTSTRAP})
 
 # True when smartpar switched off pytest-randomly's reordering for this session.
 # Written to plan.json / report.csv as ``randomly_reorder_disabled``.
@@ -125,6 +128,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="Use the --dist loadgroup fallback instead of the smartpar scheduler "
         "(diagnostics; chosen automatically for unsupported pytest-xdist versions).",
+    )
+    group.addoption(
+        "--smartpar-strict",
+        action="store_true",
+        default=False,
+        help="Fail the session if a new test failed but passed when re-run alone "
+        "(suspected dependency); by default such a test counts as passed.",
     )
     group.addoption(
         "--smartpar-child-report",
@@ -233,8 +243,8 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
 @pytest.hookimpl(optionalhook=True, tryfirst=True)
 def pytest_xdist_make_scheduler(config: pytest.Config, log: Any) -> Any:
     run = config.stash.get(RUN, None)
-    if run is None or run.mode != MODE_SMARTPAR:
-        return None  # bootstrap: xdist's load; fallback: loadgroup
+    if run is None or run.mode not in SCHEDULED_MODES:
+        return None  # fallback: xdist's loadgroup
     run.scheduler = SmartparScheduling(config, log, run.planner)
     return run.scheduler
 
@@ -346,17 +356,21 @@ def _start_smartpar(config: pytest.Config) -> None:
         if terminal is not None:
             terminal.write_line(line, yellow=True)
 
-    if not any(h.timed_runs for h in hist.tests.values()):
-        mode = MODE_BOOTSTRAP
-        if deps is None and not hist.tests:
-            say("smartpar: no data yet; run `pytest --smartpar-profile` to find dependencies")
-        say("smartpar: no measured durations: running as plain xdist to collect them")
-    elif config.getoption("smartpar_fallback"):
+    if deps is None and not hist.tests:
+        say("smartpar: no data yet; run `pytest --smartpar-profile` to find dependencies")
+    has_timings = any(h.timed_runs for h in hist.tests.values())
+    if config.getoption("smartpar_fallback"):
         mode = MODE_FALLBACK
         say("smartpar: fallback requested: --dist loadgroup, tail as a separate pass")
     elif (problem := custom_scheduler_problem()) is not None:
         mode = MODE_FALLBACK
         say(f"smartpar: {problem}; using the loadgroup fallback")
+    elif not has_timings:
+        mode = MODE_BOOTSTRAP
+        say(
+            "smartpar: no measured durations yet: every test is estimated equally "
+            "(conflicts and confirmed order pairs still apply); this run collects them"
+        )
     else:
         mode = MODE_SMARTPAR
     if mode == MODE_FALLBACK:
@@ -481,26 +495,31 @@ class SmartparRun:
         tail_failed = False
         workdir = Path(tempfile.mkdtemp(prefix="smartpar-children-"))
         try:
-            if self.mode == MODE_SMARTPAR and self.analysis and self.analysis.graph.tail:
+            if self.mode in SCHEDULED_MODES and self.analysis and self.analysis.graph.tail:
                 tail_mode = "barrier"
             if self.mode == MODE_FALLBACK and self.fallback_tail:
                 tail_mode = "separate-pass"
                 tail_failed = self._tail_pass(workdir / "tail", junit, lines)
-            if self.mode in (MODE_SMARTPAR, MODE_FALLBACK):
-                reruns = self._rerun_new_failures(workdir, junit, lines)
+            reruns = self._rerun_new_failures(workdir, junit, lines)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
+        failed_first = {
+            nodeid for nodeid, acc in self.collector.tests.items() if acc.outcome in FAILED_OUTCOMES
+        }
+        resolved = {r["nodeid"] for r in reruns if r["suspected_dependency"]}
         record = self.collector.record(
             overhead_s=self._measured_overhead(main_wall, reruns, tail_mode),
             predicted_wall_s=self._predicted_wall(),
             tail_mode=tail_mode,
             reruns=reruns,
+            failures_before_rerun=len(failed_first),
+            failures_after_rerun=len(failed_first - resolved),
         )
         hist_io.write_run(self.smartpar_dir, record)
         append_report_csv(self.smartpar_dir / REPORT_FILE, report_rows(record, self.history))
-        self._adjust_exitstatus(session, record.tests, reruns, tail_failed)
-        self._summary(record, lines)
+        self._adjust_exitstatus(session, failed_first, resolved, tail_failed)
+        self.summary_lines = self._summary(record, lines)
 
     # --- post-session passes -------------------------------------------------------
 
@@ -564,7 +583,7 @@ class SmartparRun:
     # --- numbers -------------------------------------------------------------------
 
     def _predicted_wall(self) -> float | None:
-        if self.mode == MODE_SMARTPAR and self.analysis is not None:
+        if self.mode in SCHEDULED_MODES and self.analysis is not None:
             return self.analysis.schedule.predicted_makespan_s
         if self.mode == MODE_FALLBACK:
             try:
@@ -583,7 +602,7 @@ class SmartparRun:
         Only for clean runs of the smartpar scheduler (no crash, no re-run),
         where the model T(m) = max load + tail + overhead(m) applies.
         """
-        if self.mode != MODE_SMARTPAR or reruns or self.analysis is None:
+        if self.mode not in SCHEDULED_MODES or reruns or self.analysis is None:
             return None
         if self.scheduler is None or self.scheduler.events.crashed_workers:
             return None
@@ -600,27 +619,43 @@ class SmartparRun:
     def _adjust_exitstatus(
         self,
         session: pytest.Session,
-        tests: list[TestRecord],
-        reruns: list[dict[str, Any]],
+        failed_first: set[str],
+        resolved: set[str],
         tail_failed: bool,
     ) -> None:
-        failed = {t.nodeid for t in tests if t.outcome in FAILED_OUTCOMES}
-        resolved = {r["nodeid"] for r in reruns if r["suspected_dependency"]}
-        if session.exitstatus == pytest.ExitCode.TESTS_FAILED and failed and failed <= resolved:
+        """A failure that passed when re-run alone counts as passed (exit code 0),
+        unless --smartpar-strict; a failing separate tail pass fails the session."""
+        strict = self.config.getoption("smartpar_strict")
+        if (
+            not strict
+            and session.exitstatus == pytest.ExitCode.TESTS_FAILED
+            and failed_first
+            and failed_first <= resolved
+        ):
             session.exitstatus = pytest.ExitCode.OK
-        if tail_failed and session.exitstatus == pytest.ExitCode.OK:
+        if (tail_failed or (strict and resolved)) and session.exitstatus == pytest.ExitCode.OK:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
-    def _summary(self, record: Any, lines: list[str]) -> None:
-        terminal = self.config.pluginmanager.get_plugin("terminalreporter")
-        if terminal is None:
-            return
-        terminal.ensure_newline()
-        terminal.write_sep("-", f"smartpar ({self.mode})")
+    def _summary(self, record: Any, lines: list[str]) -> list[str]:
+        out = []
         if record.predicted_wall_s is not None:
-            terminal.write_line(
-                f"wall {record.wall_time_s:.2f}s, predicted {record.predicted_wall_s:.2f}s"
-            )
+            out.append(f"wall {record.wall_time_s:.2f}s, predicted {record.predicted_wall_s:.2f}s")
+        out += lines
+        out.append(
+            f"failures: {record.failures_before_rerun} before re-runs, "
+            f"{record.failures_after_rerun} after; tail: {record.tail_mode}"
+        )
+        if self.config.getoption("smartpar_strict") and any(
+            r["suspected_dependency"] for r in record.reruns
+        ):
+            out.append("--smartpar-strict: suspected dependencies fail the session")
+        out.append(f"report: {self.smartpar_dir / REPORT_FILE}")
+        return out
+
+    def pytest_terminal_summary(self, terminalreporter: Any) -> None:
+        lines = getattr(self, "summary_lines", None)
+        if not lines:
+            return
+        terminalreporter.write_sep("-", f"smartpar ({self.mode})")
         for line in lines:
-            terminal.write_line(line)
-        terminal.write_line(f"report: {self.smartpar_dir / REPORT_FILE}")
+            terminalreporter.write_line(line)

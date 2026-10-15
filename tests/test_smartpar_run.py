@@ -287,23 +287,40 @@ def test_rerun_that_passes_makes_session_green(pytester: pytest.Pytester) -> Non
     result.stdout.fnmatch_lines(["*suspected dependency*"])
 
 
-def test_bootstrap_without_data_runs_plain_xdist(pytester: pytest.Pytester) -> None:
+def test_bootstrap_without_data_uses_smartpar_scheduler(pytester: pytest.Pytester) -> None:
     pytester.makepyfile(test_plain=SLEEPY)
     result = pytester.runpytest_subprocess("-n", "2", "--smartpar", "-v", timeout=TIMEOUT)
     result.assert_outcomes(passed=9)
     result.stdout.fnmatch_lines(
         [
             "*no data yet; run `pytest --smartpar-profile`*",
-            "*scheduling tests via LoadScheduling*",
+            "*no measured durations yet: every test is estimated equally*",
+            "*scheduling tests via SmartparScheduling*",
         ]
     )
     smartpar_dir = pytester.path / ".smartpar"
     run = last_run(smartpar_dir)
     assert run["mode"] == "smartpar-bootstrap"
     assert all(t["duration"] > 0 for t in run["tests"])
-    assert not (smartpar_dir / "plan.json").exists()
+    plan = json.loads((smartpar_dir / "plan.json").read_text())
+    assert plan["mode"] == "smartpar-bootstrap" and plan["overhead_model"] == "default"
     history.merge(smartpar_dir)
     assert all(h.timed_runs == 1 for h in history.load_history(smartpar_dir).tests.values())
+
+
+def test_bootstrap_keeps_groups_estimated_by_test_count(pytester: pytest.Pytester) -> None:
+    pytester.makepyfile(test_plain=SLEEPY)
+    ids = [f"test_plain.py::{n}" for n in ("test_s1", "test_s2", "test_s3")]
+    smartpar_dir = pytester.path / ".smartpar"
+    deps = Dependencies(file_access=dict.fromkeys(ids, FileAccess(W=["<project>/f"])))
+    history.atomic_write_json(smartpar_dir / "dependencies.json", deps.to_dict())
+    result = pytester.runpytest_subprocess("-n", "2", "--smartpar", timeout=TIMEOUT)
+    result.assert_outcomes(passed=9)
+    plan = json.loads((smartpar_dir / "plan.json").read_text())
+    groups = [u for units in plan["assignments"].values() for u in units if u[0] != "single"]
+    assert [sorted(g[1]) for g in groups] == [ids]
+    tests = by_name(last_run(smartpar_dir))
+    assert len({tests[n.split("::")[1]]["worker"] for n in ids}) == 1
 
 
 def test_smartpar_requires_workers(pytester: pytest.Pytester) -> None:
@@ -377,3 +394,52 @@ def test_child_run_keeps_argument_order_across_modules(
     record = json.loads((tmp_path / "report.json").read_text())
     ran = [t["nodeid"] for t in sorted(record["tests"], key=lambda t: t["start"])]
     assert ran == order
+
+
+def test_strict_fails_on_suspected_dependency(pytester: pytest.Pytester) -> None:
+    pytester.makepyfile(test_new="\n".join(NEW_TESTS.splitlines()[:-2]))
+    polluter, victim = "test_new.py::test_polluter", "test_new.py::test_new_victim"
+    shared = FileAccess(W=["<project>/f"])
+    smartpar_dir = write_data(
+        pytester.path,
+        {polluter: 0.01},
+        file_access={polluter: shared, victim: shared},
+        collection=[polluter, victim],
+    )
+    result = pytester.runpytest_subprocess(
+        "-n", "2", "--smartpar", "--smartpar-strict", timeout=TIMEOUT
+    )
+    assert result.ret == 1
+    result.stdout.fnmatch_lines(
+        [
+            "*- smartpar (smartpar) -*",
+            "*failures: 1 before re-runs, 0 after; tail: none*",
+            "*--smartpar-strict: suspected dependencies fail the session*",
+        ]
+    )
+    run = last_run(smartpar_dir)
+    assert (run["failures_before_rerun"], run["failures_after_rerun"]) == (1, 0)
+    total = next(r for r in report(smartpar_dir) if r["worker_id"] == "ALL")
+    assert (total["failures_before_rerun"], total["failures_after_rerun"]) == ("1", "0")
+
+
+def test_fallback_tail_failure_fails_session(pytester: pytest.Pytester) -> None:
+    pytester.makepyfile(test_tailfail="def test_ok(): pass\ndef test_nod(): assert False\n")
+    ok, nod = "test_tailfail.py::test_ok", "test_tailfail.py::test_nod"
+    smartpar_dir = write_data(
+        pytester.path, {ok: 0.01, nod: 0.01}, collection=[ok, nod], flaky=nod_flaky(nod)
+    )
+    result = pytester.runpytest_subprocess(
+        "-n", "2", "--smartpar", "--smartpar-fallback", timeout=TIMEOUT
+    )
+    result.assert_outcomes(passed=1)  # the main session itself is green
+    assert result.ret == 1  # ... but the separate tail pass failed
+    result.stdout.fnmatch_lines(
+        [
+            "*- smartpar (smartpar-fallback) -*",
+            "*isolated tail: 1 tests in a separate sequential pass (failed)*",
+            "*failures: 1 before re-runs, 1 after; tail: separate-pass*",
+        ]
+    )
+    cases = junit_cases(smartpar_dir / "results.xml")
+    assert cases["test_nod"].find("failure") is not None

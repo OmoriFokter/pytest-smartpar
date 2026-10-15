@@ -116,9 +116,9 @@ def test_apply_run_ema_and_counters() -> None:
     assert h.tests["a"].duration_ema == 1.0  # first passed run initializes
     history.apply_run(h, make_run("r2", T0, {"a": 2.0}, startup=1.0), alpha=0.3)
     assert h.tests["a"].duration_ema == pytest.approx(0.3 * 2.0 + 0.7 * 1.0)
-    # Both runs have workers=1: one calibration point, EMA of the samples.
+    # Both runs have workers=1: EMA of the samples, but only 2 clean runs.
     assert h.overhead.samples_s == {1: pytest.approx(0.3 * 1.0 + 0.7 * 0.5)}
-    assert (h.overhead.a, h.overhead.b) == (pytest.approx(0.65), 0.0)
+    assert (h.overhead.counts, h.overhead.kind) == ({1: 2}, "default")
     entry = h.tests["a"]
     assert (entry.runs, entry.timed_runs, entry.fail_count, entry.last_outcome) == (
         2,
@@ -126,6 +126,14 @@ def test_apply_run_ema_and_counters() -> None:
         0,
         "passed",
     )
+
+
+def test_overhead_point_used_after_three_clean_runs() -> None:
+    h = History()
+    for i, overhead in enumerate([0.5, 0.5, 0.5]):
+        assert h.overhead.kind == "default"
+        history.apply_run(h, make_run(f"r{i}", T0, {"a": 1.0}, startup=overhead), alpha=0.3)
+    assert (h.overhead.kind, h.overhead.a, h.overhead.b) == ("constant", 0.5, 0.0)
 
 
 @pytest.mark.parametrize("outcome", ["failed", "error", "skipped", "xfailed", "xpassed"])

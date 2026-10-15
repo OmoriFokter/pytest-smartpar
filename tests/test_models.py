@@ -9,6 +9,8 @@ import pytest
 
 from smartpar import __version__
 from smartpar.models import (
+    DEFAULT_OVERHEAD_A,
+    DEFAULT_OVERHEAD_B,
     SCHEMA_VERSION,
     History,
     Overhead,
@@ -49,7 +51,9 @@ def test_envelope_present() -> None:
 def test_history_roundtrip() -> None:
     history = History(
         tests={"t.py::a": TestHistory(0.0123, 14, "passed", 0, 13)},
-        overhead=Overhead(samples_s={1: 0.4, 2: 0.6}, a=0.2, b=0.2, fit_points=[1, 2]),
+        overhead=Overhead(
+            samples_s={1: 0.4, 2: 0.6}, counts={1: 3, 2: 4}, a=0.2, b=0.2, fit_points=[1, 2]
+        ),
         last_merged_runs=["r1"],
     )
     assert History.from_dict(roundtrip(history.to_dict())) == history
@@ -161,14 +165,15 @@ def test_flaky_order_edges_and_validation() -> None:
     ],
 )
 def test_overhead_least_squares(samples: dict, a: float, b: float, points: list) -> None:
-    model = Overhead(samples_s=dict(samples))
+    model = Overhead(samples_s=dict(samples), counts=dict.fromkeys(samples, 3))
     model.refit()
     assert (model.a, model.b, model.fit_points) == (pytest.approx(a), pytest.approx(b), points)
 
 
 def test_overhead_least_squares_noisy_and_clamped() -> None:
-    model = Overhead(samples_s={1: 1.0, 2: 0.9, 4: 0.4})
+    model = Overhead(samples_s={1: 1.0, 2: 0.9, 4: 0.4}, counts={1: 5, 2: 3, 4: 9})
     model.refit()
+    assert model.kind == "fitted"
     # OLS by hand: mean m = 7/3, mean y = 2.3/3; b = sxy / sxx.
     mean_m, mean_y = 7 / 3, 2.3 / 3
     sxy = sum((m - mean_m) * (y - mean_y) for m, y in model.samples_s.items())
@@ -176,3 +181,13 @@ def test_overhead_least_squares_noisy_and_clamped() -> None:
     assert model.b == pytest.approx(sxy / sxx)
     assert model.a == pytest.approx(mean_y - model.b * mean_m)
     assert model.predict(100) == 0.0  # a negative extrapolation is clamped
+
+
+def test_overhead_needs_three_clean_runs_per_point() -> None:
+    model = Overhead(samples_s={1: 0.5, 2: 0.7, 4: 1.1}, counts={1: 3, 2: 2, 4: 1})
+    model.refit()
+    assert (model.fit_points, model.kind, model.a, model.b) == ([1], "constant", 0.5, 0.0)
+    model.counts = {1: 2, 2: 2, 4: 2}
+    model.refit()
+    assert (model.fit_points, model.kind) == ([], "default")
+    assert (model.a, model.b) == (DEFAULT_OVERHEAD_A, DEFAULT_OVERHEAD_B)

@@ -102,29 +102,48 @@ def _number(value: Any, what: str) -> float:
     return float(value)
 
 
+# A calibration point is used only after this many clean runs at that m.
+MIN_CLEAN_RUNS = 3
+# Model used until enough clean runs exist ("default"): no overhead assumed,
+# so T(m) is the LPT makespan plus the tail.
+DEFAULT_OVERHEAD_A = 0.0
+DEFAULT_OVERHEAD_B = 0.0
+
+
 @dataclass
 class Overhead:
     """Parallel overhead model ``overhead(m) = a + b*m`` (a hypothesis to test).
 
     ``samples_s`` holds the EMA of the measured overhead per number of
-    workers; ``a`` and ``b`` are refitted by least squares over the samples at
-    m in CALIBRATION_WORKERS after every merge. With one calibration point the
-    model is the constant ``a``; without any, zero.
+    workers, ``counts`` the number of clean runs behind it. After every merge
+    ``a`` and ``b`` are refitted by least squares over the samples at m in
+    CALIBRATION_WORKERS that have at least MIN_CLEAN_RUNS runs:
+    two or more such points - "fitted"; one - "constant" (``a`` only);
+    none - "default" (DEFAULT_OVERHEAD_A/B).
     """
 
     samples_s: dict[int, float] = field(default_factory=dict)
-    a: float = 0.0
-    b: float = 0.0
+    counts: dict[int, int] = field(default_factory=dict)
+    a: float = DEFAULT_OVERHEAD_A
+    b: float = DEFAULT_OVERHEAD_B
     fit_points: list[int] = field(default_factory=list)
+
+    @property
+    def kind(self) -> str:
+        return {0: "default", 1: "constant"}.get(len(self.fit_points), "fitted")
 
     def predict(self, workers: int) -> float:
         return max(0.0, self.a + self.b * workers)
 
     def refit(self) -> None:
-        points = sorted((m, y) for m, y in self.samples_s.items() if m in CALIBRATION_WORKERS)
+        points = sorted(
+            (m, y)
+            for m, y in self.samples_s.items()
+            if m in CALIBRATION_WORKERS and self.counts.get(m, 0) >= MIN_CLEAN_RUNS
+        )
         self.fit_points = [m for m, _y in points]
         if not points:
-            self.a = self.b = 0.0
+            self.a, self.b = DEFAULT_OVERHEAD_A, DEFAULT_OVERHEAD_B
         elif len(points) == 1:
             self.a, self.b = points[0][1], 0.0
         else:
@@ -139,25 +158,31 @@ class Overhead:
     def to_dict(self) -> dict[str, Any]:
         return {
             "samples_s": {str(m): y for m, y in sorted(self.samples_s.items())},
+            "counts": {str(m): c for m, c in sorted(self.counts.items())},
             "a": self.a,
             "b": self.b,
             "fit_points": self.fit_points,
+            "model": self.kind,
         }
 
     @classmethod
     def from_dict(cls, data: Any, what: str) -> Overhead:
         if not isinstance(data, dict):
             raise SchemaError(f"{what}: expected a JSON object")
-        samples = _get(data, "samples_s", dict, what)
         try:
-            parsed = {int(m): _number(y, f"{what} sample {m!r}") for m, y in samples.items()}
-        except ValueError as exc:
-            raise SchemaError(f"{what}: sample keys must be worker counts") from exc
+            samples = {
+                int(m): _number(y, f"{what} sample {m!r}")
+                for m, y in _get(data, "samples_s", dict, what).items()
+            }
+            counts = {int(m): int(c) for m, c in data.get("counts", {}).items()}
+        except (ValueError, TypeError) as exc:
+            raise SchemaError(f"{what}: keys must be worker counts") from exc
         points = _get(data, "fit_points", list, what)
         if not all(isinstance(m, int) and not isinstance(m, bool) for m in points):
             raise SchemaError(f"{what}: fit_points must be integers")
         return cls(
-            samples_s=parsed,
+            samples_s=samples,
+            counts=counts,
             a=_number(_get(data, "a", (int, float), what), what),
             b=_number(_get(data, "b", (int, float), what), what),
             fit_points=list(points),
@@ -258,6 +283,10 @@ class RunRecord:
     # New tests that failed and were re-run alone in a child process:
     # {"nodeid", "first_outcome", "rerun_outcome", "duration", "suspected_dependency"}.
     reruns: list[dict[str, Any]] = field(default_factory=list)
+    # Failed/error tests before and after re-running failed new tests alone
+    # (a test that passed alone no longer counts after).
+    failures_before_rerun: int = 0
+    failures_after_rerun: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -295,6 +324,8 @@ class RunRecord:
             ),
             tail_mode=data.get("tail_mode", "none"),
             reruns=_obj_list(data.get("reruns", []), f"{what}: reruns"),
+            failures_before_rerun=int(data.get("failures_before_rerun", 0)),
+            failures_after_rerun=int(data.get("failures_after_rerun", 0)),
         )
 
 

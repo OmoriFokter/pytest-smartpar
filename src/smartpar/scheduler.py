@@ -204,6 +204,7 @@ class Analysis:
     curve: dict[int, float]
     recommended_workers: int
     schedule: Schedule
+    overhead_model: str = "default"  # Overhead.kind: default / constant / fitted
 
 
 def analyze(
@@ -241,4 +242,4 @@ def analyze(
     curve = predicted_curve(units, tail_s, history.overhead, max_workers)
     recommended = recommend_workers(curve)
     plan = schedule(units, workers or recommended, graph.tail, est.durations, history.overhead)
-    return Analysis(est, graph, units, curve, recommended, plan)
+    return Analysis(est, graph, units, curve, recommended, plan, history.overhead.kind)
