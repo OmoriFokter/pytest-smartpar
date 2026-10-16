@@ -6,6 +6,13 @@ goes to the currently least loaded worker. The rule is deterministic: equal
 durations are ordered by the unit's first nodeid, equally loaded workers by
 worker number.
 
+LPT decides *where* a unit runs; *when* it runs on its worker does not change
+the worker's load, so each worker runs its units in the collection order of the
+project. Tests of one module (class) then stay together and in their usual
+relative order: module- and class-scoped fixtures are set up once per worker
+instead of once per interleaving, and a test that relies on an earlier test of
+its module (a common, undeclared dependency) sees the order it was written for.
+
 The isolated tail (NOD tests and unresolved order cycles) runs after all
 workers have finished, sequentially, so
 
@@ -141,14 +148,29 @@ class Schedule:
     oversized_groups: list[str] = field(default_factory=list)
 
 
+def in_collection_order(units: list[Unit], collection_index: Mapping[str, int]) -> list[Unit]:
+    """Units sorted by the collection position of their first test; tests without
+    a position (e.g. collected only now) go last, by nodeid."""
+    end = len(collection_index)
+
+    def key(unit: Unit) -> tuple[int, str]:
+        return (min(collection_index.get(t, end) for t in unit.tests), min(unit.tests))
+
+    return sorted(units, key=key)
+
+
 def schedule(
     units: list[Unit],
     workers: int,
     tail: list[str],
     durations: Mapping[str, float],
     overhead: Overhead | None = None,
+    collection_index: Mapping[str, int] | None = None,
 ) -> Schedule:
     result = lpt(units, workers)
+    if collection_index:
+        # Same units per worker (same loads), run in the project's order.
+        result.assignments = [in_collection_order(a, collection_index) for a in result.assignments]
     tail_s = sum(durations.get(t, 0.0) for t in tail)
     over = overhead.predict(workers) if overhead else 0.0
     makespan = result.makespan + tail_s + over
@@ -225,21 +247,29 @@ def analyze(
     tests = sorted(set(tests))
     est = estimate_durations(tests, history)
     isolate = set(flaky.nod_tests() if flaky else ())
+    index = (
+        collection_index
+        if collection_index is not None
+        else (deps.collection_index if deps else None)
+    )
     graph = build_graph(
         tests,
         deps.file_access if deps else {},
         flaky.order_edges() if flaky else [],
         est.durations,
         isolate=isolate,
-        collection_index=(
-            collection_index
-            if collection_index is not None
-            else (deps.collection_index if deps else None)
-        ),
+        collection_index=index,
     )
     units = units_from_graph(graph, est.durations)
     tail_s = sum(est.durations[t] for t in graph.tail)
     curve = predicted_curve(units, tail_s, history.overhead, max_workers)
     recommended = recommend_workers(curve)
-    plan = schedule(units, workers or recommended, graph.tail, est.durations, history.overhead)
+    plan = schedule(
+        units,
+        workers or recommended,
+        graph.tail,
+        est.durations,
+        history.overhead,
+        collection_index=index,
+    )
     return Analysis(est, graph, units, curve, recommended, plan, history.overhead.kind)

@@ -110,6 +110,27 @@ def test_schedule_adds_tail_and_overhead(caplog: pytest.LogCaptureFixture) -> No
     assert list(plan.assignments) == ["gw0", "gw1"]
 
 
+def test_workers_run_their_units_in_collection_order() -> None:
+    # LPT places by duration; each worker then runs its units in the project's
+    # collection order, which does not change its load.
+    durations = {"m1::a": 1.0, "m2::b": 5.0, "m1::c": 2.0, "m2::d": 3.0, "new": 1.0}
+    index = {"m1::a": 0, "m1::c": 1, "m2::b": 2, "m2::d": 3}
+    units = [*singles(durations), Unit("g0", ("m2::x", "m1::y"), 4.0)]
+    index.update({"m1::y": 4, "m2::x": 5})
+    plain = scheduler.schedule(units, 2, tail=[], durations=durations)
+    ordered = scheduler.schedule(units, 2, tail=[], durations=durations, collection_index=index)
+    assert ordered.loads == plain.loads
+    for worker, assigned in ordered.assignments.items():
+        assert sorted(assigned, key=lambda u: u.tests) == sorted(
+            plain.assignments[worker], key=lambda u: u.tests
+        )
+        firsts = [min(index.get(t, len(index)) for t in u.tests) for u in assigned]
+        assert firsts == sorted(firsts)
+    # A test without a collection position ("new") runs after the others.
+    (worker,) = [w for w, a in ordered.assignments.items() if any("new" in u.tests for u in a)]
+    assert ordered.assignments[worker][-1].tests == ("new",)
+
+
 def test_curve_and_recommendation_with_startup_cost() -> None:
     units = singles({f"t{i}": 1.0 for i in range(8)})
     curve = scheduler.predicted_curve(units, 0.0, Overhead(a=0.0, b=0.5), max_workers=8)
