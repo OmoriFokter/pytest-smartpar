@@ -126,6 +126,7 @@ class AuditStats:
     unresolved_dir_fd: int = 0  # relative path + dir_fd, cannot be resolved
     ignored: int = 0  # filtered out (stdlib, site-packages, tmp, /dev ...)
     existing_dir_mkdir: int = 0  # mkdir/makedirs of an existing directory: not a write
+    directory_opens: int = 0  # `open` of an existing directory: names no file
 
 
 class FileAccessRecorder:
@@ -157,9 +158,17 @@ class FileAccessRecorder:
     def handle(self, event: str, args: tuple[Any, ...]) -> None:
         """Audit events arrive *before* the operation, so ``isdir`` sees the old state."""
         if event == "open":
-            self._add(
-                self._resolve(args[0], None), WRITE if is_write_open(args[1], args[2]) else READ
-            )
+            path = self._resolve(args[0], None)
+            if path is not None and os.path.isdir(path):
+                # A directory names no file that a test reads or writes: an
+                # O_TMPFILE open creates an anonymous file, and since Python
+                # 3.12 NamedTemporaryFile passes its directory to `open` with
+                # an opener that creates a uniquely named file (the event shows
+                # e.g. open('/tmp', 'w+')). Recording it as a write would make
+                # every two tests with temporary files conflict.
+                self.stats.directory_opens += 1
+            else:
+                self._add(path, WRITE if is_write_open(args[1], args[2]) else READ)
         elif event in ("os.remove", "os.unlink"):
             self._add(self._resolve(args[0], args[1]), WRITE)
         elif event in ("os.rmdir", "shutil.rmtree"):

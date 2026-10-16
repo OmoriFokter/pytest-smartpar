@@ -83,6 +83,18 @@ def test_mkdir_of_existing_directory_is_not_a_write(
     assert recorder.stats.existing_dir_mkdir == 1
 
 
+@pytest.mark.parametrize(
+    ("mode", "flags"),
+    [("w+", os.O_RDWR | os.O_CREAT), (None, os.O_RDWR), (None, os.O_RDONLY)],
+)
+def test_open_of_a_directory_is_not_an_access(
+    recorder: FileAccessRecorder, tmp_path: Path, mode: str | None, flags: int
+) -> None:
+    recorder.handle("open", (str(tmp_path), mode, flags))
+    assert rw(recorder) == (set(), set(), set())
+    assert recorder.stats.directory_opens == 1
+
+
 @pytest.mark.parametrize("event", ["os.rename", "os.replace", "shutil.move"])
 def test_moving_a_directory_writes_both_subtrees(
     recorder: FileAccessRecorder, tmp_path: Path, event: str
@@ -720,6 +732,29 @@ def test_default_ignore_state(pytester: pytest.Pytester) -> None:
     pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
     deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
     assert deps["state_changes"] == {}
+
+
+def test_named_temporary_files_do_not_conflict(pytester: pytest.Pytester) -> None:
+    # Since Python 3.12 NamedTemporaryFile emits open('<tmpdir>', 'w+') and
+    # then creates a uniquely named file: two such tests share nothing.
+    pytester.makepyfile(
+        test_tmp="""
+        import tempfile
+
+        def test_one():
+            with tempfile.NamedTemporaryFile("wb+") as fh:
+                fh.write(b"1")
+
+        def test_two():
+            with tempfile.NamedTemporaryFile("wb+") as fh:
+                fh.write(b"2")
+        """
+    )
+    result = pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
+    result.assert_outcomes(passed=2)
+    deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
+    assert deps["conflicts"] == []
+    assert deps["groups"] == []
 
 
 DIRECTORY_TESTS = """
