@@ -115,7 +115,11 @@ def test_jobs_and_shuffled_order() -> None:
 def test_config_args(tmp_path: Path) -> None:
     assert run_benchmarks.config_args("serial", 4, tmp_path) == ["-p", "no:xdist"]
     assert run_benchmarks.config_args("xdist-loadfile", 2, tmp_path)[-2:] == ["--dist", "loadfile"]
-    assert "--smartpar" in run_benchmarks.config_args("smartpar", 2, tmp_path)
+    smartpar = run_benchmarks.config_args("smartpar", 2, tmp_path)
+    assert "--smartpar" in smartpar
+    # One token: a separate path would count as a test path for the rootdir.
+    assert f"--smartpar-dir={tmp_path}" in smartpar
+    assert str(tmp_path) not in smartpar
 
 
 # --- projects and clean state ---------------------------------------------------------------

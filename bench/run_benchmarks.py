@@ -117,8 +117,19 @@ def config_args(config: str, workers: int, data_dir: Path) -> list[str]:
     if config == "xdist-loadfile":
         return ["-n", str(workers), "--dist", "loadfile"]
     if config == "smartpar":
-        return ["-n", str(workers), "--smartpar", "--smartpar-dir", str(data_dir)]
+        return ["-n", str(workers), "--smartpar", data_dir_arg(data_dir)]
     raise ValueError(config)
+
+
+def data_dir_arg(data_dir: Path) -> str:
+    """``--smartpar-dir`` as one ``--opt=value`` token.
+
+    pytest looks for its configuration file before plugin options are known,
+    so the value of a separate ``--smartpar-dir PATH`` would count as a test
+    path: the rootdir would become the common ancestor of the project and the
+    data directory, and the project's own pytest configuration would be lost.
+    """
+    return f"--smartpar-dir={data_dir}"
 
 
 def jobs_for(configs: list[str], workers: list[int]) -> list[tuple[str, int]]:
@@ -184,7 +195,7 @@ class Bench:
     ) -> dict[str, Any]:
         if self.master.exists():
             shutil.rmtree(self.master)
-        data = ["--smartpar-dir", str(self.master)]
+        data = [data_dir_arg(self.master)]
         clean_state(self.project, self.work)
         # Profiling is instrumented and serial: allow several plain runs.
         profile_timeout = PROFILE_TIMEOUT_FACTOR * self.run_timeout if self.run_timeout else None
@@ -197,19 +208,18 @@ class Bench:
             )
         shutil.copy(self.master / "dependencies.json", self.raw / "deps_after_profile.json")
         # The detector's runs re-enable pytest-randomly themselves.
+        # Plugin options as single tokens, like --smartpar-dir (see data_dir_arg).
         detect_args = [
             "--smartpar-detect",
             "-p",
             "randomly",
-            "--smartpar-runs",
-            str(detect_runs),
-            "--smartpar-seed",
-            str(detect_seed),
+            f"--smartpar-runs={detect_runs}",
+            f"--smartpar-seed={detect_seed}",
             *data,
         ]
         detect_timeout = None
         if self.detect_budget is not None:
-            detect_args += ["--smartpar-detect-budget", str(self.detect_budget)]
+            detect_args.append(f"--smartpar-detect-budget={self.detect_budget}")
             # The budget stops new child runs; one running child may still finish.
             detect_timeout = self.detect_budget + (self.run_timeout or 0) + 60
         detect = self.pytest(detect_args, timeout=detect_timeout)
