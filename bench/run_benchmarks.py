@@ -50,6 +50,7 @@ from bench.setup_projects import (
     REPO_ROOT,
     Project,
     bench_env,
+    check_work_dir,
     clean_state,
     load_projects,
     machine_info,
@@ -345,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         help="seconds for --smartpar-detect (passed as --smartpar-detect-budget)",
     )
     args = parser.parse_args(argv)
+    args.work = check_work_dir(args.work)
 
     cores = physical_cores()
     workers = sorted({m for m in args.workers if m <= cores})

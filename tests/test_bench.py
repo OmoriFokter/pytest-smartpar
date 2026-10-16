@@ -165,6 +165,17 @@ def test_projects_yaml_pins_every_git_project() -> None:
             assert len(p.sha) == 40 and all(c in "0123456789abcdef" for c in p.sha)
 
 
+def test_workspace_is_outside_the_repository(tmp_path: Path) -> None:
+    # Inside it, a project without its own pytest configuration would use the
+    # repository's pyproject.toml.
+    root = setup_projects.REPO_ROOT
+    assert root not in setup_projects.DEFAULT_WORK.resolve().parents
+    assert setup_projects.check_work_dir(tmp_path / "work") == (tmp_path / "work").resolve()
+    for inside in (root, root / "bench" / "work"):
+        with pytest.raises(SystemExit, match="inside the repository"):
+            setup_projects.check_work_dir(inside)
+
+
 def test_projects_share_one_python_version_unless_overridden(tmp_path: Path) -> None:
     projects = setup_projects.load_projects()
     assert {p.python for p in projects} == {"3.12"}

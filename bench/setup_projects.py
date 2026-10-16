@@ -3,7 +3,8 @@
     python bench/setup_projects.py [--only NAME ...]          # set up
     python bench/setup_projects.py --survey [--only NAME ...] # + one serial run each
 
-Layout (``bench/work`` by default, git-ignored)::
+Layout (``../smartpar-work`` next to the repository by default; never inside
+it, see ``DEFAULT_WORK``)::
 
     work/<name>/src    the project at its SHA (a clone, or a committed snapshot
                        of a project inside this repository)
@@ -35,7 +36,11 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROJECTS = REPO_ROOT / "bench" / "projects.yaml"
-DEFAULT_WORK = REPO_ROOT / "bench" / "work"
+# Outside the repository: pytest looks for its configuration upwards from the
+# tests, so a project without its own (e.g. networkx) would pick up this
+# repository's pyproject.toml - rootdir, addopts - and the detector would copy
+# the whole repository for every child run.
+DEFAULT_WORK = REPO_ROOT.parent / f"{REPO_ROOT.name}-work"
 SNAPSHOT_IGNORE = shutil.ignore_patterns(
     ".smartpar", "output", "__pycache__", ".pytest_cache", ".venv", "venv"
 )
@@ -349,6 +354,18 @@ def survey(project: Project, work: Path) -> dict[str, Any]:
     }
 
 
+def check_work_dir(work: Path) -> Path:
+    """The workspace, absolute; refuse one inside this repository (see DEFAULT_WORK)."""
+    work = work.resolve()
+    if work == REPO_ROOT or REPO_ROOT in work.parents:
+        raise SystemExit(
+            f"--work {work} is inside the repository {REPO_ROOT}: projects without their "
+            "own pytest configuration would use the repository's one. Use a directory "
+            f"outside it (default: {DEFAULT_WORK})."
+        )
+    return work
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--projects", type=Path, default=DEFAULT_PROJECTS)
@@ -356,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", nargs="*")
     parser.add_argument("--survey", action="store_true", help="one serial run per project")
     args = parser.parse_args(argv)
+    args.work = check_work_dir(args.work)
     projects = select(load_projects(args.projects), args.only)
     results: list[dict[str, Any]] = []
     out = REPO_ROOT / "bench" / "results" / f"survey_{datetime.now():%Y%m%d_%H%M%S}.json"
