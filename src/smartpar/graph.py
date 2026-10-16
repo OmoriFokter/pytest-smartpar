@@ -4,7 +4,10 @@ Edges come from two sources only:
 
 * file conflicts, i.e. violations of Bernstein's conditions (Bernstein, 1966)
   ``W(A)∩R(B)=∅``, ``R(A)∩W(B)=∅``, ``W(A)∩W(B)=∅`` - "not concurrently";
-  a subtree write of a directory intersects every path below it;
+  a subtree write of a directory intersects every path below it. Creating a
+  directory is a write that commutes with itself (it is idempotent): two
+  creations of one directory do not conflict, a creation and a read, a write
+  or a subtree write of the path do;
 * confirmed order dependencies from flaky.json - "``before`` runs before
   ``after``" (victim before polluter, state setter before brittle test).
 
@@ -38,15 +41,20 @@ REASON_OD = "od"
 def find_conflicts(file_access: Mapping[str, FileAccess], tests: Iterable[str]) -> list[Conflict]:
     """Pairs of tests violating Bernstein's conditions, one entry per (a, b, resource).
 
-    Uses an inverted index resource -> readers/writers, so only tests sharing a
-    resource are compared (not all n^2 pairs). A subtree write (``W_tree``) of
-    directory D conflicts with every access to D or a path below it, found by
-    a range search over the sorted resources. Tests outside ``tests`` are
-    ignored.
+    Uses an inverted index resource -> readers/writers/creators, so only tests
+    sharing a resource are compared (not all n^2 pairs). A subtree write
+    (``W_tree``) of directory D conflicts with every access to D or a path below
+    it, found by a range search over the sorted resources. A directory creation
+    (``C``) conflicts with any write and with a read of the same path, but not
+    with another creation. Tests outside ``tests`` are ignored.
+
+    ``kind`` names the accesses of ``a`` and ``b`` (``W``, ``C`` or ``R``; a
+    test that both writes and reads a path counts as writing it).
     """
     universe = set(tests)
     readers: dict[str, set[str]] = defaultdict(set)
     writers: dict[str, set[str]] = defaultdict(set)  # plain and subtree writes
+    creators: dict[str, set[str]] = defaultdict(set)
     tree_writers: dict[str, set[str]] = defaultdict(set)
     for nodeid, access in file_access.items():
         if nodeid not in universe:
@@ -58,40 +66,45 @@ def find_conflicts(file_access: Mapping[str, FileAccess], tests: Iterable[str]) 
         for resource in access.W_tree:
             writers[resource].add(nodeid)
             tree_writers[resource].add(nodeid)
+        for resource in access.C:
+            creators[resource].add(nodeid)
+
+    def kind_of(test: str, path: str) -> str:
+        if test in writers.get(path, ()):
+            return "W"
+        return "C" if test in creators.get(path, ()) else "R"
 
     conflicts: set[Conflict] = set()
 
-    def add(writer: str, other: str, resource: str, other_writes: bool) -> None:
-        if writer == other:
+    def add(first: str, first_kind: str, second: str, second_kind: str, resource: str) -> None:
+        if first == second:
             return
-        a, b = sorted((writer, other))
-        a_writes = a == writer or other_writes
-        b_writes = b == writer or other_writes
-        conflicts.add(Conflict(a, b, resource, _kind(a_writes, b_writes)))
+        (a, a_kind), (b, b_kind) = sorted(((first, first_kind), (second, second_kind)))
+        conflicts.add(Conflict(a, b, resource, f"{a_kind}-{b_kind}"))
 
-    for resource, ws in writers.items():
+    paths = sorted(readers.keys() | writers.keys() | creators.keys())
+    for path in paths:
+        ws = writers.get(path, set())
+        cs = creators.get(path, set()) - ws
+        rs = readers.get(path, set()) - ws
         for w in ws:
-            for other in ws | readers.get(resource, set()):
-                add(w, other, resource, other in ws)
+            for other in ws | cs | rs:
+                add(w, "W", other, kind_of(other, path), path)
+        for c in cs:
+            for r in rs - cs:
+                add(c, "C", r, "R", path)
 
-    paths = sorted(readers.keys() | writers.keys())
     for directory, tws in tree_writers.items():
         # Every path below ``directory`` starts with "directory/" and sorts
         # before "directory0" ('0' follows '/').
         lo = bisect.bisect_left(paths, directory + "/")
         hi = bisect.bisect_left(paths, directory + "0")
         for path in paths[lo:hi]:
-            ws = writers.get(path, set())
+            others = writers.get(path, set()) | creators.get(path, set()) | readers.get(path, set())
             for w in tws:
-                for other in ws | readers.get(path, set()):
-                    add(w, other, path, other in ws)
+                for other in others:
+                    add(w, "W", other, kind_of(other, path), path)
     return sorted(conflicts)
-
-
-def _kind(a_writes: bool, b_writes: bool) -> str:
-    if a_writes and b_writes:
-        return "W-W"
-    return "W-R" if a_writes else "R-W"
 
 
 # --- union-find --------------------------------------------------------------------

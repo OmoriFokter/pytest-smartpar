@@ -49,9 +49,12 @@ def recorder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FileAccessRecor
     return rec
 
 
-def rw(rec: FileAccessRecorder) -> tuple[set[str], set[str], set[str]]:
-    """(reads, writes, subtree writes) of the current test."""
-    return rec.access.get("t::x", (set(), set(), set()))
+NONE: tuple[set[str], set[str], set[str], set[str]] = (set(), set(), set(), set())
+
+
+def rw(rec: FileAccessRecorder) -> tuple[set[str], set[str], set[str], set[str]]:
+    """(reads, writes, subtree writes, created directories) of the current test."""
+    return rec.access.get("t::x", NONE)
 
 
 def test_recorder_events_with_real_signatures(recorder: FileAccessRecorder, tmp_path: Path) -> None:
@@ -65,21 +68,23 @@ def test_recorder_events_with_real_signatures(recorder: FileAccessRecorder, tmp_
     recorder.handle("shutil.rmtree", (f"{p}/tree", None))
     recorder.handle("shutil.copyfile", (f"{p}/cp_src", f"{p}/cp_dst"))
     recorder.handle("shutil.move", (f"{p}/mv_src", f"{p}/mv_dst"))
-    reads, writes, trees = rw(recorder)
+    reads, writes, trees, created = rw(recorder)
     assert reads == {f"{p}/r.txt", f"{p}/cp_src"}
     assert writes == {
-        f"{p}/{name}"
-        for name in ("w.txt", "rm.txt", "src", "dst", "newdir", "cp_dst", "mv_src", "mv_dst")
+        f"{p}/{name}" for name in ("w.txt", "rm.txt", "src", "dst", "cp_dst", "mv_src", "mv_dst")
     }
     assert trees == {f"{p}/rmdir", f"{p}/tree"}
+    assert created == {f"{p}/newdir"}
 
 
-def test_mkdir_of_existing_directory_is_not_a_write(
+def test_mkdir_is_a_creation_whether_or_not_the_directory_exists(
     recorder: FileAccessRecorder, tmp_path: Path
 ) -> None:
+    # So the result does not depend on directories left over by earlier runs.
     (tmp_path / "exists").mkdir()
     recorder.handle("os.mkdir", (str(tmp_path / "exists"), 0o777, -1))
-    assert rw(recorder) == (set(), set(), set())
+    recorder.handle("os.mkdir", (str(tmp_path / "new"), 0o777, -1))
+    assert rw(recorder) == (set(), set(), set(), {str(tmp_path / "exists"), str(tmp_path / "new")})
     assert recorder.stats.existing_dir_mkdir == 1
 
 
@@ -91,7 +96,7 @@ def test_open_of_a_directory_is_not_an_access(
     recorder: FileAccessRecorder, tmp_path: Path, mode: str | None, flags: int
 ) -> None:
     recorder.handle("open", (str(tmp_path), mode, flags))
-    assert rw(recorder) == (set(), set(), set())
+    assert rw(recorder) == NONE
     assert recorder.stats.directory_opens == 1
 
 
@@ -102,7 +107,8 @@ def test_moving_a_directory_writes_both_subtrees(
     (tmp_path / "srcdir").mkdir()
     args = (str(tmp_path / "srcdir"), str(tmp_path / "dstdir"))
     recorder.handle(event, (*args, -1, -1) if event != "shutil.move" else args)
-    assert rw(recorder) == (set(), set(), {str(tmp_path / "srcdir"), str(tmp_path / "dstdir")})
+    moved = {str(tmp_path / "srcdir"), str(tmp_path / "dstdir")}
+    assert rw(recorder) == (set(), set(), moved, set())
 
 
 def test_recorder_relative_bytes_and_descriptors(
@@ -112,7 +118,7 @@ def test_recorder_relative_bytes_and_descriptors(
     recorder.handle("os.remove", (b"b.txt", -1))  # bytes path, dir_fd=-1 means "none"
     recorder.handle("os.remove", ("c.txt", 7))  # relative to an unknown dir_fd
     recorder.handle("open", (5, "r", 0))  # already open descriptor
-    _reads, writes, _trees = rw(recorder)
+    _reads, writes, _trees, _created = rw(recorder)
     assert writes == {str(tmp_path / "rel" / "a.txt"), str(tmp_path / "b.txt")}
     assert recorder.stats.unresolved_dir_fd == 1
     assert recorder.stats.fd_events == 1
@@ -133,7 +139,7 @@ def test_recorder_relative_bytes_and_descriptors(
 def test_recorder_ignores(recorder: FileAccessRecorder, tmp_path: Path, path: str) -> None:
     recorder.set_ignore_dirs([tmp_path / "ignored", "/dev", "/proc"])
     recorder.handle("open", (path.format(ignored=tmp_path / "ignored"), "w", 0))
-    assert rw(recorder) == (set(), set(), set())
+    assert rw(recorder) == NONE
     assert recorder.stats.ignored == 1
 
 
@@ -496,16 +502,19 @@ def test_profile_serial(profiled_project: pytest.Pytester, monkeypatch: pytest.M
 
     deps = load(profiled_project, "dependencies.json")
     access = deps["file_access"]
-    assert access[NODE + "test_write"]["W"] == ["<project>/build", "<project>/build/cfg.ini"]
+    assert access[NODE + "test_write"]["W"] == ["<project>/build/cfg.ini"]
+    assert access[NODE + "test_write"]["C"] == ["<project>/build"]
     assert rw_only(access[NODE + "test_read"]) == {
         "R": ["<project>/build/cfg.ini"],
         "W": [],
         "W_tree": [],
+        "C": [],
     }
     assert rw_only(access[NODE + "test_copy_and_remove"]) == {
         "R": ["<project>/README.txt"],
         "W": ["<project>/build_copy.txt"],
         "W_tree": [],
+        "C": [],
     }
     assert NODE + "test_tmp_path_ignored" not in access
 
@@ -761,10 +770,10 @@ DIRECTORY_TESTS = """
 import os, shutil
 
 def test_a_create_new_dir():
-    os.makedirs("out/new", exist_ok=True)  # out and out/new are new: plain writes
+    os.makedirs("out/new", exist_ok=True)  # creates out and out/new
 
 def test_b_makedirs_existing():
-    os.makedirs("out/new", exist_ok=True)  # already exists: not a write
+    os.makedirs("out/new", exist_ok=True)  # out/new exists: still a creation of it
 
 def test_c_write_inside():
     with open("out/new/data.txt", "w") as fh:
@@ -782,6 +791,22 @@ def test_f_rename_dir():
 """
 
 
+# rmtree of out/ conflicts with everything at or below it; two creations of
+# out/new do not conflict, nor does creating out/new with reading or writing a
+# file inside it.
+DIRECTORY_PAIRS = {
+    ("test_a_create_new_dir", "test_e_rmtree"),
+    ("test_b_makedirs_existing", "test_e_rmtree"),
+    ("test_c_write_inside", "test_e_rmtree"),
+    ("test_d_read_inside", "test_e_rmtree"),
+    ("test_c_write_inside", "test_d_read_inside"),
+}
+
+
+def directory_pairs(deps: dict) -> set[tuple[str, str]]:
+    return {(c["a"].split("::")[1], c["b"].split("::")[1]) for c in deps["conflicts"]}
+
+
 def test_profile_directory_operations(pytester: pytest.Pytester) -> None:
     pytester.makepyfile(test_dirs=DIRECTORY_TESTS)
     result = pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
@@ -790,29 +815,35 @@ def test_profile_directory_operations(pytester: pytest.Pytester) -> None:
     access = {k.split("::")[1]: rw_only(v) for k, v in deps["file_access"].items()}
     assert access["test_a_create_new_dir"] == {
         "R": [],
-        "W": ["<project>/out", "<project>/out/new"],
+        "W": [],
         "W_tree": [],
+        "C": ["<project>/out", "<project>/out/new"],
     }
-    assert "test_b_makedirs_existing" not in access
+    assert access["test_b_makedirs_existing"]["C"] == ["<project>/out/new"]
     assert access["test_e_rmtree"]["W_tree"] == ["<project>/out"]
     assert access["test_f_rename_dir"]["W_tree"] == ["<project>/moved_dst", "<project>/moved_src"]
     assert deps["profile_stats"]["existing_dir_mkdir"] == 1  # one mkdir of the existing leaf
 
-    pairs = {(c["a"].split("::")[1], c["b"].split("::")[1]) for c in deps["conflicts"]}
-    # rmtree of out/ conflicts with everything below it; creating out/new
-    # does not conflict with reading or writing a file inside it.
-    assert {
-        ("test_a_create_new_dir", "test_e_rmtree"),
-        ("test_c_write_inside", "test_e_rmtree"),
-        ("test_d_read_inside", "test_e_rmtree"),
-        ("test_c_write_inside", "test_d_read_inside"),
-    } == pairs
+    assert directory_pairs(deps) == DIRECTORY_PAIRS
+    kinds = {c["kind"] for c in deps["conflicts"] if c["resource"] == "<project>/out/new"}
+    assert kinds == {"C-W"}  # creations of out/new vs rmtree of out
     # Collection order is saved and drives the order inside the group.
     (group,) = deps["groups"]
     assert [t.split("::")[1] for t in group["order"]] == [
         "test_a_create_new_dir",
+        "test_b_makedirs_existing",
         "test_c_write_inside",
         "test_d_read_inside",
         "test_e_rmtree",
     ]
     assert deps["collection_index"]["test_dirs.py::test_f_rename_dir"] == 5
+
+
+def test_directory_conflicts_do_not_depend_on_leftovers(pytester: pytest.Pytester) -> None:
+    # out/new is left over from an earlier run: the conflicts stay the same.
+    (pytester.path / "out" / "new").mkdir(parents=True)
+    pytester.makepyfile(test_dirs=DIRECTORY_TESTS)
+    result = pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
+    result.assert_outcomes(passed=6)
+    deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
+    assert directory_pairs(deps) == DIRECTORY_PAIRS

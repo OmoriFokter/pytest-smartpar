@@ -332,7 +332,7 @@ class RunRecord:
 # --- dependencies.json -----------------------------------------------------------
 
 
-ACCESS_KINDS = ("R", "W", "W_tree")
+ACCESS_KINDS = ("R", "W", "W_tree", "C")
 SOURCE_PROFILE = "profile"
 SOURCE_DETECT = "detect"
 
@@ -344,6 +344,11 @@ class FileAccess:
     # Directories whose whole subtree is written (rmtree, rmdir, rename/move of
     # a directory): conflicts with any access at or below the path.
     W_tree: list[str] = field(default_factory=list)
+    # Directories created (``mkdir``, also of a directory that already exists,
+    # as with ``makedirs(exist_ok=True)``). Creation is idempotent: two
+    # creations of one directory do not conflict; a creation conflicts with a
+    # read or write of the same path and with a subtree write above it.
+    C: list[str] = field(default_factory=list)
     # Accesses seen only in the detector's child runs: kind -> {resource: "detect"}.
     # Every other access has source "profile" (seen during profiling).
     sources: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -512,6 +517,7 @@ class Dependencies:
                 W_tree=_str_list(
                     access.get("W_tree", []), f"{what}: file_access {nodeid!r} W_tree"
                 ),
+                C=_str_list(access.get("C", []), f"{what}: file_access {nodeid!r} C"),
                 sources={
                     k: {r: src for r, src in v.items() if src != SOURCE_PROFILE}
                     for k, v in sources.items()

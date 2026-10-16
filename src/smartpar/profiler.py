@@ -108,7 +108,8 @@ _EVENTS = frozenset(
     }
 )
 _NO_DIR_FD = (None, -1)
-READ, WRITE, WRITE_TREE = 0, 1, 2
+# Indexes of the recorder's sets, in the order of models.ACCESS_KINDS.
+READ, WRITE, WRITE_TREE, CREATE_DIR = 0, 1, 2, 3
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
 _WRITE_MODE_CHARS = frozenset("wax+")
 
@@ -125,7 +126,7 @@ class AuditStats:
     fd_events: int = 0  # operations on an already open descriptor
     unresolved_dir_fd: int = 0  # relative path + dir_fd, cannot be resolved
     ignored: int = 0  # filtered out (stdlib, site-packages, tmp, /dev ...)
-    existing_dir_mkdir: int = 0  # mkdir/makedirs of an existing directory: not a write
+    existing_dir_mkdir: int = 0  # mkdir of a directory that already exists (still a creation)
     directory_opens: int = 0  # `open` of an existing directory: names no file
 
 
@@ -134,8 +135,8 @@ class FileAccessRecorder:
 
     def __init__(self, ignore_dirs: Iterable[str | Path] = ()) -> None:
         self.current: str | None = None
-        # nodeid -> (reads, writes, subtree writes)
-        self.access: dict[str, tuple[set[str], set[str], set[str]]] = {}
+        # nodeid -> (reads, writes, subtree writes, created directories)
+        self.access: dict[str, tuple[set[str], set[str], set[str], set[str]]] = {}
         self.stats = AuditStats()
         self.set_ignore_dirs(ignore_dirs)
 
@@ -184,8 +185,9 @@ class FileAccessRecorder:
             path = self._resolve(args[0], args[2])
             if path is not None and os.path.isdir(path):
                 self.stats.existing_dir_mkdir += 1  # makedirs(exist_ok=True) etc.
-            else:
-                self._add(path, WRITE)  # a new directory: only this path
+            # A creation whether or not the directory already exists, so the
+            # result does not depend on files left over by earlier runs.
+            self._add(path, CREATE_DIR)
         elif event == "shutil.copyfile":
             self._add(self._resolve(args[0], None), READ)
             self._add(self._resolve(args[1], None), WRITE)
@@ -211,7 +213,7 @@ class FileAccessRecorder:
         if path is None:
             return
         assert self.current is not None
-        sets = self.access.setdefault(self.current, (set(), set(), set()))
+        sets = self.access.setdefault(self.current, (set(), set(), set(), set()))
         sets[kind].add(path)
 
 
@@ -494,7 +496,7 @@ class ProfileData:
 def access_from_raw(
     raw: dict[str, dict[str, list[str]]], root: Path, source: str
 ) -> dict[str, FileAccess]:
-    """{nodeid: {"R"|"W"|"W_tree": [absolute paths]}} -> FileAccess with resources."""
+    """{nodeid: {"R"|"W"|"W_tree"|"C": [absolute paths]}} -> FileAccess with resources."""
     out: dict[str, FileAccess] = {}
     for nodeid, kinds in raw.items():
         access = out.setdefault(nodeid, FileAccess())
@@ -692,8 +694,10 @@ class ProfilerPlugin:
     def _own_profile(self) -> ProfileData:
         return ProfileData(
             file_access={
-                nodeid: {"R": sorted(r), "W": sorted(w), "W_tree": sorted(t)}
-                for nodeid, (r, w, t) in self.recorder.access.items()
+                nodeid: {
+                    kind: sorted(paths) for kind, paths in zip(ACCESS_KINDS, sets, strict=True)
+                }
+                for nodeid, sets in self.recorder.access.items()
             },
             state_changes=self.state_changes,
             stats=vars(self.recorder.stats).copy(),

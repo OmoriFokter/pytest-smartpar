@@ -214,3 +214,19 @@ def test_file_access_sources() -> None:
 
     deps = Dependencies(file_access={"t": access})
     assert Dependencies.from_dict(roundtrip(deps.to_dict())).file_access["t"] == access
+
+
+def test_file_access_directory_creations() -> None:
+    from smartpar.models import Dependencies, FileAccess
+
+    access = FileAccess(W=["<project>/out/f"])
+    access.add("C", "<project>/out", "detect")
+    assert access.only({"detect"}).C == ["<project>/out"]
+    assert access.only({"profile"}) == FileAccess(W=["<project>/out/f"])
+    data = Dependencies(file_access={"t": access}).to_dict()
+    assert data["file_access"]["t"]["C"] == ["<project>/out"]
+    assert Dependencies.from_dict(roundtrip(data)).file_access["t"] == access
+    # A file written before directory creations were recorded has no "C".
+    del data["file_access"]["t"]["C"]
+    del data["file_access"]["t"]["source"]["C"]
+    assert Dependencies.from_dict(roundtrip(data)).file_access["t"].C == []

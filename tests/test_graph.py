@@ -122,6 +122,35 @@ def test_nested_subtree_writes_conflict() -> None:
     ]
 
 
+def test_directory_creation_commutes_with_itself() -> None:
+    out = "<project>/out"
+    access = {
+        "mk1": FileAccess(C=[out]),
+        "mk2": FileAccess(C=[out]),  # creating the same directory: no conflict
+        "inside": fa(w=[out + "/f"]),  # a file inside the created directory
+        "clean": FileAccess(W_tree=[out]),
+        "clash": fa(w=[out]),  # a file at the directory's own path
+        "probe": fa(r=[out]),
+    }
+    assert graph.find_conflicts(access, access) == [
+        Conflict("clash", "clean", out, "W-W"),
+        Conflict("clash", "mk1", out, "W-C"),
+        Conflict("clash", "mk2", out, "W-C"),
+        Conflict("clash", "probe", out, "W-R"),
+        Conflict("clean", "inside", out + "/f", "W-W"),
+        Conflict("clean", "mk1", out, "W-C"),
+        Conflict("clean", "mk2", out, "W-C"),
+        Conflict("clean", "probe", out, "W-R"),
+        Conflict("mk1", "probe", out, "C-R"),
+        Conflict("mk2", "probe", out, "C-R"),
+    ]
+
+
+def test_creation_below_a_subtree_write_conflicts() -> None:
+    access = {"mk": FileAccess(C=["<project>/a/b"]), "clean": FileAccess(W_tree=["<project>/a"])}
+    assert graph.find_conflicts(access, access) == [Conflict("clean", "mk", "<project>/a/b", "W-C")]
+
+
 def test_plain_directory_write_is_not_a_subtree_write() -> None:
     # Creating a new directory writes only that path.
     access = {"mk": fa(w=["<project>/out"]), "reader": fa(r=["<project>/out/f"])}
