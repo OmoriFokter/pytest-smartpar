@@ -1,15 +1,17 @@
 # Projects of the experiment. Every git project is pinned to a commit SHA
 # (resolved with `git ls-remote` from the tag in `ref`, which is informational).
 #
-# Candidates: the final choice is made by the authors after
-#   python bench/setup_projects.py --survey
-# `install` and `deselect` of the real projects are first guesses that the
-# survey has to confirm (number of tests, failures "out of the box",
-# network-dependent tests to deselect). Placeholders: {python} - the
-# project's virtualenv interpreter.
+# Chosen after `python bench/setup_projects.py --survey` (Python 3.12): suites
+# of different length - Pydantic (~6k small tests, ~20 s serial), networkx
+# (~5.7k tests, ~1 min) and pylint (~2.2k tests, ~2 min). Rich and attrs were
+# dropped: their suites take a few seconds, too short for parallel execution.
+# `deselect` lists tests that fail "out of the box" or are not unit tests.
+# Placeholders: {python} - the project's virtualenv interpreter.
 # One interpreter version for every project of a series, so that results are
 # comparable. 3.12: pydantic-core 2.23.4 (Pydantic v2.9.2) has no build for
 # 3.14. A project may override it with its own `python:`.
+# pytest is pinned to 8.3 in every venv: the same runner for all projects, and
+# Pydantic v2.9.2 turns a pytest 9 deprecation warning into collection errors.
 python: "3.12"
 
 projects:
@@ -18,33 +20,11 @@ projects:
     # as a snapshot, so `git clean -xdf` restores it like any clone.
     local: examples/control_project
     tests: tests
-    install: []
+    install:
+      - "{python} -m pip install pytest~=8.3.0"
     pytest_args: []
     deselect: []
     ground_truth: examples/control_project/ground_truth.json
-
-  - name: rich
-    repo: https://github.com/Textualize/rich.git
-    ref: v13.9.4
-    sha: 43d3b04725ab9731727fb1126e35980c62f32377
-    tests: tests
-    install:
-      - "{python} -m pip install -e ."
-      - "{python} -m pip install attrs"
-    pytest_args: []
-    deselect: []
-    status: candidate
-
-  - name: attrs
-    repo: https://github.com/python-attrs/attrs.git
-    ref: 24.2.0
-    sha: 6771a04893780166e4b7826b63599f43ac30d00a
-    tests: tests
-    install:
-      - "{python} -m pip install -e .[tests]"
-    pytest_args: []
-    deselect: []
-    status: candidate
 
   - name: pydantic
     repo: https://github.com/pydantic/pydantic.git
@@ -53,7 +33,35 @@ projects:
     tests: tests
     install:
       - "{python} -m pip install -e ."
-      - "{python} -m pip install dirty-equals pytest-mock pytest-examples faker jsonschema"
+      # The `testing` dependency group of Pydantic's pyproject.toml.
+      - "{python} -m pip install cloudpickle pytz dirty-equals eval-type-backport pytest-mock pytest-pretty pytest-examples faker pytest-benchmark pytest-codspeed~=2.2.0 packaging jsonschema pytest~=8.3.0"
+    pytest_args: []
+    deselect:
+      # Performance benchmarks, not unit tests.
+      - tests/benchmarks
+      # Fails out of the box in the survey.
+      - tests/test_types.py::test_constraints_on_str_like
+    status: selected
+
+  - name: networkx
+    repo: https://github.com/networkx/networkx.git
+    ref: networkx-3.4.2
+    sha: 2acf1590f82757c01a57b81b8c5dfb79e60aa416
+    # Tests live next to the code (networkx/**/tests).
+    tests: networkx
+    install:
+      - "{python} -m pip install -e .[default,test] pytest~=8.3.0"
     pytest_args: []
     deselect: []
-    status: candidate
+    status: selected
+
+  - name: pylint
+    repo: https://github.com/pylint-dev/pylint.git
+    ref: v3.3.1
+    sha: 76bce72bc57cc8089e439cc9d22fed5806341ed4
+    tests: tests
+    install:
+      - "{python} -m pip install -r requirements_test_min.txt pytest~=8.3.0"
+    pytest_args: []
+    deselect: []
+    status: selected

@@ -123,7 +123,7 @@ def test_config_args(tmp_path: Path) -> None:
 
 def test_projects_yaml_pins_every_git_project() -> None:
     projects = setup_projects.load_projects()
-    assert {p.name for p in projects} >= {"control_project", "rich", "attrs", "pydantic"}
+    assert {p.name for p in projects} >= {"control_project", "pydantic", "networkx", "pylint"}
     for p in projects:
         if p.local is None:
             assert len(p.sha) == 40 and all(c in "0123456789abcdef" for c in p.sha)
