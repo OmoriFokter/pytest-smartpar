@@ -41,6 +41,27 @@ SNAPSHOT_IGNORE = shutil.ignore_patterns(
 )
 # Excluded from `git clean` even if someone puts a venv inside src.
 CLEAN_KEEP = (".venv", "venv")
+# Every xdist worker must collect the tests in the same order, otherwise xdist
+# refuses to run ("Different tests were collected"). Parametrization over a
+# set breaks this in two ways: the order of a set depends on the hash seed,
+# random in every process by default, and a set constant compiled into a .pyc
+# by one worker and loaded by another may iterate in a different order even
+# with the same seed. Hence a fixed seed and no .pyc writes for every
+# benchmarked run; the same environment for every configuration keeps the
+# comparison fair (``clean_state`` removes __pycache__ before each run anyway).
+BENCH_HASH_SEED = "0"
+
+
+def bench_env(**extra: str) -> dict[str, str]:
+    """Environment of a benchmarked pytest run (child processes inherit it)."""
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(REPO_ROOT),
+        "PYTHONHASHSEED": BENCH_HASH_SEED,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    env.pop("SMARTPAR_BENCH_TIMING", None)
+    return {**env, **extra}
 
 
 @dataclass
@@ -294,7 +315,7 @@ def survey(project: Project, work: Path) -> dict[str, Any]:
     src, venv = project.paths(work)
     clean_state(project, work)
     timing = work / project.name / "survey_timing.jsonl"
-    env = {**os.environ, "SMARTPAR_BENCH_TIMING": str(timing), "PYTHONPATH": str(REPO_ROOT)}
+    env = bench_env(SMARTPAR_BENCH_TIMING=str(timing))
     cmd = [
         str(venv_python(venv)),
         "-m",

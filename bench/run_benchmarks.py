@@ -44,10 +44,12 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bench.setup_projects import (
+    BENCH_HASH_SEED,
     DEFAULT_PROJECTS,
     DEFAULT_WORK,
     REPO_ROOT,
     Project,
+    bench_env,
     clean_state,
     load_projects,
     machine_info,
@@ -168,10 +170,7 @@ class Bench:
     def pytest(
         self, args: list[str], timing: Path | None = None, timeout: float | None = None
     ) -> Outcome:
-        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
-        env.pop("SMARTPAR_BENCH_TIMING", None)
-        if timing is not None:
-            env["SMARTPAR_BENCH_TIMING"] = str(timing)
+        env = bench_env() if timing is None else bench_env(SMARTPAR_BENCH_TIMING=str(timing))
         cmd = [
             str(self.python),
             "-m",
@@ -377,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
         "order_seed": args.order_seed,
         "run_timeout_s": args.run_timeout,
         "detect_budget_s": args.detect_budget,
+        "python_hash_seed": BENCH_HASH_SEED,
         "projects": {},
     }
     for project in projects:

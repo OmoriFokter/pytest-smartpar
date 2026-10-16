@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,37 @@ def test_config_args(tmp_path: Path) -> None:
     # One token: a separate path would count as a test path for the rootdir.
     assert f"--smartpar-dir={tmp_path}" in smartpar
     assert str(tmp_path) not in smartpar
+
+
+def test_bench_env_fixes_collection_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", "random")
+    monkeypatch.setenv("SMARTPAR_BENCH_TIMING", "/stale/timing.jsonl")
+    env = setup_projects.bench_env()
+    assert env["PYTHONHASHSEED"] == setup_projects.BENCH_HASH_SEED
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert "SMARTPAR_BENCH_TIMING" not in env
+    timed = setup_projects.bench_env(SMARTPAR_BENCH_TIMING="t.jsonl")
+    assert timed["SMARTPAR_BENCH_TIMING"] == "t.jsonl"
+
+
+def test_set_parametrization_runs_under_xdist_with_bench_env(tmp_path: Path) -> None:
+    # The order of a set of strings depends on the hash seed (random per
+    # process) and may change when one worker loads the set constant from a
+    # .pyc written by another: without bench_env the workers' orders differ.
+    names = ", ".join(repr(f"name{i}") for i in range(30))
+    (tmp_path / "test_set.py").write_text(
+        f"import pytest\n\n@pytest.mark.parametrize('x', {{{names}}})\ndef test_x(x):\n    pass\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-n", "2", "-p", "no:randomly", "test_set.py"],
+        cwd=tmp_path,
+        env=setup_projects.bench_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "30 passed" in proc.stdout
 
 
 # --- projects and clean state ---------------------------------------------------------------
