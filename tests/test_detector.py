@@ -207,6 +207,51 @@ def test_nothing_flaky() -> None:
     assert (flaky.od_victims, flaky.od_brittle, flaky.nod, flaky.unresolved) == ([], [], [], [])
 
 
+def test_recorded_runs_reveal_what_random_orders_missed() -> None:
+    # No random runs at all: only recorded processes - the serial profiling run
+    # (everything passes) and two smartpar workers, where "brittle" ran without
+    # its setter and "victim" after its polluter.
+    suite = FakeSuite(
+        [*TESTS, "setter", "brittle", "polluter", "victim"],
+        victims={"victim": ["polluter"]},
+        brittle={"brittle": "setter"},
+    )
+    serial = suite._run([*TESTS, "setter", "brittle", "victim", "polluter"])
+    worker0 = suite._run(["t00", "brittle", "t01"])
+    worker1 = suite._run(["polluter", "t02", "victim"])
+    assert serial.returncode == 0 and worker0.failed("brittle") and worker1.failed("victim")
+    flaky = Detector(suite, {}).detect([], observed=[serial, worker0, worker1])
+    assert flaky.runs == 0
+    assert [(b["test"], b["state_setters"]) for b in flaky.od_brittle] == [("brittle", ["setter"])]
+    assert [(v["victim"], v["polluters"]) for v in flaky.od_victims] == [("victim", ["polluter"])]
+    assert flaky.od_brittle[0]["fail_rate"] == "1/3"
+
+
+def test_observed_runs_are_one_result_per_process() -> None:
+    from smartpar.models import RunRecord, TestRecord
+
+    def rec(nodeid: str, worker: str, start: float, outcome: str = "passed") -> TestRecord:
+        return TestRecord(nodeid, outcome, 0.1, worker, start, start + 0.1)
+
+    run = RunRecord(
+        run_id="r",
+        mode="smartpar",
+        workers=2,
+        started_at="2026-10-17T00:00:00+00:00",
+        finished_at="2026-10-17T00:00:01+00:00",
+        wall_time_s=1.0,
+        tests=[
+            rec("b", "gw0", 2.0, "failed"),
+            rec("a", "gw0", 1.0),
+            rec("c", "gw1", 1.5),
+            rec("gone", "gw1", 0.5),  # no longer in the suite
+        ],
+    )
+    results = detector.observed_runs([run], ["a", "b", "c"])
+    assert [(r.order, r.returncode) for r in results] == [(["a", "b"], 1), (["c"], 0)]
+    assert results[0].failed("b") and results[1].passed("c")
+
+
 # --- building blocks -----------------------------------------------------------------
 
 

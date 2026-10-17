@@ -113,6 +113,33 @@ def test_jobs_and_shuffled_order() -> None:
     assert len(orders) > 1  # a new order in every repeat
 
 
+def test_smartpar_failures_for_the_feedback(tmp_path: Path) -> None:
+    from smartpar.models import RunRecord, TestRecord
+
+    def write(run_id: str, mode: str, outcomes: dict[str, str], merged: bool) -> None:
+        tests = [
+            TestRecord(n, o, 0.1, "gw0", float(i), i + 0.1)
+            for i, (n, o) in enumerate(outcomes.items())
+        ]
+        run = RunRecord(
+            run_id, mode, 2, "2026-10-17T00:00:00+00:00", "2026-10-17T00:00:01+00:00", 1.0, tests
+        )
+        directory = tmp_path / "runs" / ("merged" if merged else "")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"run_{run_id}.json").write_text(json.dumps(run.to_dict()))
+
+    write("a", "profile", {"p": "failed"}, merged=True)  # not a smartpar run
+    write("b", "smartpar", {"t1": "failed", "t2": "passed", "nod": "failed"}, merged=True)
+    write("c", "smartpar-bootstrap", {"t3": "error"}, merged=False)
+    (tmp_path / "flaky.json").write_text(json.dumps({"nod": [{"test": "nod"}]}))
+    failed, ids = run_benchmarks.smartpar_failures(tmp_path, set())
+    assert failed == {"t1", "t3"}  # NOD tests fail by design
+    assert ids == {"b", "c"}  # run ids of the smartpar runs
+    # Runs already seen are skipped: only failures of later runs count.
+    later, later_ids = run_benchmarks.smartpar_failures(tmp_path, ids)
+    assert (later, later_ids) == (set(), set())
+
+
 def test_config_args(tmp_path: Path) -> None:
     assert run_benchmarks.config_args("serial", 4, tmp_path) == ["-p", "no:xdist"]
     assert run_benchmarks.config_args("xdist-loadfile", 2, tmp_path)[-2:] == ["--dist", "loadfile"]

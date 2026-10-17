@@ -4,6 +4,12 @@
    ``base_seed + i``), every run a fresh ``python -m pytest`` process.
    Runs in a given order keep pytest-randomly's re-seeding with their own
    seeds (``base_seed + runs + j``), so repeated isolated runs differ.
+   Earlier recorded runs (runs/ and runs/merged/: profiling, smartpar runs)
+   are added as observations, one per process with its tests in start order.
+   This closes a gap of random orders: a test that fails only when it is the
+   first of its module, or with a combination of tests that a random order
+   rarely produces, is seen once a plan has produced it - the analysis below
+   is the same for it.
 2. Every test that failed at least once is run alone ``k`` times:
 
    * fails alone sometimes, but not always - NOD (not order-dependent);
@@ -101,6 +107,24 @@ class RunResult:
         return self.outcomes.get(nodeid) == "passed"
 
 
+def observed_runs(records: Iterable[RunRecord], nodeids: Iterable[str]) -> list[RunResult]:
+    """Recorded runs as observations: one result per process (worker), its tests
+    in start order, restricted to ``nodeids`` (the suite being analysed)."""
+    wanted = set(nodeids)
+    results = []
+    for record in records:
+        by_worker: dict[str, list[Any]] = {}
+        for test in record.tests:
+            if test.nodeid in wanted:
+                by_worker.setdefault(test.worker, []).append(test)
+        for _worker, tests in sorted(by_worker.items()):
+            tests.sort(key=lambda t: (t.start, t.nodeid))
+            outcomes = {t.nodeid: t.outcome for t in tests}
+            failed = any(o in FAILED_OUTCOMES for o in outcomes.values())
+            results.append(RunResult(outcomes, [t.nodeid for t in tests], int(failed)))
+    return results
+
+
 class Runner(Protocol):
     def random_runs(self, seeds: Sequence[int]) -> list[RunResult]: ...
 
@@ -195,12 +219,14 @@ class Detector:
             self._cache[key] = self.runner.ordered_runs([list(order)])[0]
         return self._cache[key]
 
-    def detect(self, seeds: Sequence[int]) -> Flaky:
-        runs = self.runner.random_runs(seeds)
+    def detect(self, seeds: Sequence[int], observed: Sequence[RunResult] = ()) -> Flaky:
+        """``observed``: earlier recorded runs (``observed_runs``), analysed like
+        the random runs; fail rates count both."""
+        runs = [*self.runner.random_runs(seeds), *observed]
         total = len(runs)
         failing = sorted({t for r in runs for t in r.outcomes if r.failed(t)})
         fails = {t: sum(r.failed(t) for r in runs) for t in failing}
-        flaky = Flaky(runs=total, seeds=list(seeds))
+        flaky = Flaky(runs=len(seeds), seeds=list(seeds))
 
         try:
             alone = self.runner.ordered_runs([[t] for t in failing for _ in range(self.k)])

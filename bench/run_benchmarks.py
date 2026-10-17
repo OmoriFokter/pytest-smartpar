@@ -7,9 +7,11 @@ Projects must be set up first (``setup_projects.py``). Per project:
 1. **Preparation** (timed and reported separately as the method's overhead):
    clean state -> ``--smartpar-profile`` -> ``--smartpar-detect`` (same
    working tree, as in CI), then ``--warmup`` smartpar runs per m to measure
-   durations and calibrate the overhead model (also timed separately). The
-   smartpar data directory lives outside the project, so cleaning the project
-   never deletes it.
+   durations and calibrate the overhead model (also timed separately). If a
+   test fails in a warm-up run, detection runs once more - it reads the
+   recorded runs, so it analyses that failure - and the warm-up is repeated
+   (``feedback`` in prep.json). The smartpar data directory lives outside the
+   project, so cleaning the project never deletes it.
 2. **Measurement**: configurations ``serial`` (-p no:xdist), ``xdist-load``,
    ``xdist-loadfile`` and ``smartpar``, each with m in ``--workers`` (serial
    once), ``--repeats`` times. The order of the runs is shuffled anew in every
@@ -60,6 +62,7 @@ from bench.setup_projects import (
     venv_python,
     versions,
 )
+from smartpar.history import load_run_records
 
 CONFIGS = ("serial", "xdist-load", "xdist-loadfile", "smartpar")
 PROFILE_TIMEOUT_FACTOR = 3
@@ -122,6 +125,25 @@ def config_args(config: str, workers: int, data_dir: Path) -> list[str]:
     if config == "smartpar":
         return ["-n", str(workers), "--smartpar", data_dir_arg(data_dir)]
     raise ValueError(config)
+
+
+def smartpar_failures(data_dir: Path, skip: set[str]) -> tuple[set[str], set[str]]:
+    """Tests that failed in the recorded smartpar runs of ``data_dir`` whose run id
+    is not in ``skip``, without the NOD tests of flaky.json; and those run ids."""
+    flaky = data_dir / "flaky.json"
+    nod = (
+        {entry["test"] for entry in json.loads(flaky.read_text()).get("nod", [])}
+        if flaky.exists()
+        else set()
+    )
+    failed: set[str] = set()
+    ids: set[str] = set()
+    for run in load_run_records(data_dir):
+        if not run.mode.startswith("smartpar") or run.run_id in skip:
+            continue
+        ids.add(run.run_id)
+        failed |= {t.nodeid for t in run.tests if t.outcome in FAILED}
+    return failed - nod, ids
 
 
 def data_dir_arg(data_dir: Path) -> str:
@@ -223,15 +245,36 @@ class Bench:
             # The budget stops new child runs; one running child may still finish.
             detect_timeout = self.detect_budget + (self.run_timeout or 0) + 60
         detect = self.pytest(detect_args, timeout=detect_timeout)
-        warmup_s = 0.0
-        warmup_timeouts = 0
-        for m in workers:
-            for _ in range(warmup):
-                clean_state(self.project, self.work)
-                run = self.pytest(["-n", str(m), "--smartpar", *data], timeout=self.run_timeout)
-                warmup_s += run.wall_s
-                warmup_timeouts += run.timed_out
-                self._merge(self.master)
+        warmup_s, warmup_timeouts = self._warmup(workers, warmup, data)
+        # Feedback: a test that failed in a warm-up smartpar run (and is not a
+        # known NOD test) points to a dependency the random orders missed. The
+        # detector reads the recorded runs, so running it again analyses that
+        # failure; the warm-up is then repeated with the corrected plan. Its
+        # time is part of the method's one-time cost.
+        failed, seen = smartpar_failures(self.master, set())
+        feedback: dict[str, Any] = {
+            "failed_tests": sorted(failed),
+            "detect_s": 0.0,
+            "detect_timed_out": False,
+            "warmup_s": 0.0,
+            "warmup_timeouts": 0,
+            "still_failing": [],
+        }
+        if failed:
+            print(
+                f"   {len(failed)} test(s) failed in smartpar warm-up runs: detecting again "
+                "with the recorded runs as observations"
+            )
+            again = self.pytest(detect_args, timeout=detect_timeout)
+            s, t = self._warmup(workers, warmup, data)
+            still, _ = smartpar_failures(self.master, seen)
+            feedback.update(
+                detect_s=again.wall_s,
+                detect_timed_out=again.timed_out,
+                warmup_s=s,
+                warmup_timeouts=t,
+                still_failing=sorted(still),
+            )
         clean_state(self.project, self.work)
         flaky = self.master / "flaky.json"
         unresolved = json.loads(flaky.read_text())["unresolved"] if flaky.exists() else None
@@ -251,10 +294,24 @@ class Bench:
             "warmup_s": warmup_s,
             "warmup_timeouts": warmup_timeouts,
             "run_timeout_s": self.run_timeout,
-            "overhead_s": profile.wall_s + detect.wall_s,  # one-time cost of the method
+            "feedback": feedback,
+            # One-time cost of the method (the feedback detection included).
+            "overhead_s": profile.wall_s + detect.wall_s + feedback["detect_s"],
         }
         (self.raw / "prep.json").write_text(json.dumps(prep, indent=2))
         return prep
+
+    def _warmup(self, workers: list[int], runs: int, data: list[str]) -> tuple[float, int]:
+        """``runs`` smartpar runs per m, each merged into the history: (seconds, timeouts)."""
+        seconds, timeouts = 0.0, 0
+        for m in workers:
+            for _ in range(runs):
+                clean_state(self.project, self.work)
+                run = self.pytest(["-n", str(m), "--smartpar", *data], timeout=self.run_timeout)
+                seconds += run.wall_s
+                timeouts += run.timed_out
+                self._merge(self.master)
+        return seconds, timeouts
 
     def _merge(self, data_dir: Path) -> None:
         subprocess.run(
@@ -428,6 +485,17 @@ def main(argv: list[str] | None = None) -> int:
             + (" (timed out)" if prep["detect_timed_out"] else "")
             + f", warm-up {prep['warmup_s']:.1f}s"
         )
+        feedback = prep["feedback"]
+        if feedback["failed_tests"]:
+            print(
+                f"   feedback: detect {feedback['detect_s']:.1f}s, warm-up "
+                f"{feedback['warmup_s']:.1f}s for {len(feedback['failed_tests'])} failed test(s)"
+            )
+        if feedback["still_failing"]:
+            print(
+                f"   WARNING: {len(feedback['still_failing'])} test(s) still fail in smartpar "
+                f"warm-up runs after the feedback: {', '.join(feedback['still_failing'][:5])}"
+            )
         for repeat in range(args.repeats):
             order = shuffled(jobs, args.order_seed, repeat)
             (bench.raw / f"order_r{repeat}.json").write_text(json.dumps(order))

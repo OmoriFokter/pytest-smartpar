@@ -30,6 +30,7 @@ from smartpar.detector import (
     ProcessRunner,
     Sandbox,
     choose_seeds,
+    observed_runs,
 )
 from smartpar.graph import build as build_graph
 from smartpar.models import (
@@ -795,9 +796,12 @@ def run_detection(
         max_pair_checks=limits["max_pair_checks"],
         max_orders=limits["max_orders_per_victim"],
     )
+    # Earlier runs (profiling, smartpar runs) as observations: a failure that a
+    # plan produced is analysed even if no random order reproduces it.
+    observed = observed_runs(hist_io.load_run_records(smartpar_dir), nodeids)
     try:
         try:
-            flaky = detector.detect(seeds)
+            flaky = detector.detect(seeds, observed)
         except BudgetExceeded:  # during the random runs themselves
             flaky = Flaky(runs=0, seeds=seeds, unresolved=[{"test": "*", "reason": "budget"}])
     finally:
@@ -815,6 +819,7 @@ def run_detection(
         "budget_s": budget,
         "elapsed_s": time.monotonic() - t0,
         "child_runs": runner.child_runs,
+        "observed_runs": len(observed),
         "parallel_runs": runner.workers,
         "sandbox": "sequential in the project directory"
         if sandbox.in_place

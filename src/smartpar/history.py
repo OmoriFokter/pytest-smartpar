@@ -160,6 +160,21 @@ def iter_run_files(smartpar_dir: Path) -> Iterator[Path]:
     yield from sorted((Path(smartpar_dir) / RUNS_DIR).glob("run_*.json"))
 
 
+def load_run_records(smartpar_dir: Path) -> list[RunRecord]:
+    """Every recorded run, pending (runs/) and merged (runs/merged/), by start time.
+
+    Invalid files are skipped with a warning: a reader must not fail on them.
+    """
+    runs = Path(smartpar_dir) / RUNS_DIR
+    records = []
+    for path in sorted([*runs.glob("run_*.json"), *(runs / MERGED_DIR).glob("run_*.json")]):
+        try:
+            records.append(RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8"))))
+        except (OSError, json.JSONDecodeError, SchemaError, UnicodeDecodeError) as exc:
+            log.warning("smartpar: skipping invalid run file %s: %s", path, exc)
+    return sorted(records, key=lambda r: (r.started_at, r.run_id))
+
+
 def apply_run(history: History, run: RunRecord, alpha: float) -> None:
     """Fold one run into the history (EMA of durations, counters).
 
