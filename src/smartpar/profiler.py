@@ -114,6 +114,15 @@ _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
 _WRITE_MODE_CHARS = frozenset("wax+")
 
 
+def _has_entries(path: str) -> bool:
+    """True for a directory with at least one entry (an rmdir of it will fail)."""
+    try:
+        with os.scandir(path) as entries:
+            return next(entries, None) is not None
+    except OSError:
+        return False
+
+
 def is_write_open(mode: str | None, flags: int) -> bool:
     if mode is not None:
         return not _WRITE_MODE_CHARS.isdisjoint(mode)
@@ -128,6 +137,7 @@ class AuditStats:
     ignored: int = 0  # filtered out (stdlib, site-packages, tmp, /dev ...)
     existing_dir_mkdir: int = 0  # mkdir of a directory that already exists (still a creation)
     directory_opens: int = 0  # `open` of an existing directory: names no file
+    nonempty_rmdir: int = 0  # rmdir of a non-empty directory: fails, changes nothing
 
 
 class FileAccessRecorder:
@@ -173,7 +183,15 @@ class FileAccessRecorder:
         elif event in ("os.remove", "os.unlink"):
             self._add(self._resolve(args[0], args[1]), WRITE)
         elif event in ("os.rmdir", "shutil.rmtree"):
-            self._add(self._resolve(args[0], args[1]), WRITE_TREE)
+            path = self._resolve(args[0], args[1])
+            if event == "os.rmdir" and path is not None and _has_entries(path):
+                # rmdir of a non-empty directory fails and changes nothing.
+                # os.removedirs tries every parent this way until one is not
+                # empty; recording those attempts as subtree writes would
+                # make the test conflict with everything below, e.g. tests/.
+                self.stats.nonempty_rmdir += 1
+            else:
+                self._add(path, WRITE_TREE)
         elif event in ("os.rename", "os.replace", "shutil.move"):
             src_fd, dst_fd = (args[2], args[3]) if len(args) > 2 else (None, None)
             src, dst = self._resolve(args[0], src_fd), self._resolve(args[1], dst_fd)

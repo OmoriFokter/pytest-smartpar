@@ -100,6 +100,47 @@ def test_open_of_a_directory_is_not_an_access(
     assert recorder.stats.directory_opens == 1
 
 
+def test_rmdir_of_a_non_empty_directory_is_not_a_write(
+    recorder: FileAccessRecorder, tmp_path: Path
+) -> None:
+    (tmp_path / "full").mkdir()
+    (tmp_path / "full" / "f.txt").write_text("x")
+    (tmp_path / "empty").mkdir()
+    recorder.handle("os.rmdir", (str(tmp_path / "full"), -1))  # will fail: changes nothing
+    recorder.handle("os.rmdir", (str(tmp_path / "empty"), -1))
+    assert rw(recorder) == (set(), set(), {str(tmp_path / "empty")}, set())
+    assert recorder.stats.nonempty_rmdir == 1
+
+
+REMOVEDIRS_TESTS = """
+import os
+
+def test_a_removedirs():
+    os.makedirs("data/deep/leaf")
+    open("data/deep/leaf/f.txt", "w").close()
+    os.remove("data/deep/leaf/f.txt")
+    # An absolute path, as in pylint's test_parseable_file_path: removes leaf,
+    # deep, data, then tries the (non-empty) project directory and stops.
+    os.removedirs(os.path.abspath("data/deep/leaf"))
+
+def test_b_reader():
+    open("readme.txt").read()
+"""
+
+
+def test_removedirs_records_only_removed_directories(pytester: pytest.Pytester) -> None:
+    pytester.makepyfile(test_rmdirs=REMOVEDIRS_TESTS)
+    pytester.path.joinpath("readme.txt").write_text("hello")
+    result = pytester.runpytest_subprocess("--smartpar-profile", "-p", "no:cacheprovider")
+    result.assert_outcomes(passed=2)
+    deps = json.loads((pytester.path / ".smartpar" / "dependencies.json").read_text())
+    access = deps["file_access"]["test_rmdirs.py::test_a_removedirs"]
+    # The project root is not empty: the attempt to remove it is not a write.
+    assert access["W_tree"] == ["<project>/data", "<project>/data/deep", "<project>/data/deep/leaf"]
+    assert deps["profile_stats"]["nonempty_rmdir"] >= 1
+    assert deps["conflicts"] == []
+
+
 @pytest.mark.parametrize("event", ["os.rename", "os.replace", "shutil.move"])
 def test_moving_a_directory_writes_both_subtrees(
     recorder: FileAccessRecorder, tmp_path: Path, event: str
